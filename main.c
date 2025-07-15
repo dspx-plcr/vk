@@ -10,11 +10,18 @@
 #define SIZE_T_MAX ((size_t)-1)
 
 static const char *progname = "My Little Vulkan App";
+static const float width = 1920;
+static const float height = 1080;
 
-VkInstance instance;
-VkDevice device;
+static VkInstance instance;
+static VkDevice device;
+static VkRenderPass renderpass;
+static VkPipelineLayout layout;
+static VkShaderModule vertshader;
+static VkShaderModule fragshader;
+static VkPipeline pipeline;
 
-const char *
+static const char *
 vkstrerror(VkResult res)
 {
 	switch (res) {
@@ -41,16 +48,42 @@ vkstrerror(VkResult res)
 	}
 }
 
-char
-usabledev(VkPhysicalDeviceProperties2 props)
+static char
+usabledev(VkPhysicalDevice dev, VkPhysicalDeviceProperties2 props)
 {
 	if (VK_API_VERSION_MAJOR(props.properties.apiVersion) != 1 ||
 			VK_API_VERSION_MINOR(props.properties.apiVersion) < 1)
 		return 0;
-	return 1;
+
+	if (props.properties.limits.maxViewportDimensions[0] < width ||
+			props.properties.limits.maxViewportDimensions[1] < height)
+		return 0;
+
+	uint32_t qcnt;
+	vkGetPhysicalDeviceQueueFamilyProperties2(dev, &qcnt, NULL);
+	VkQueueFamilyProperties2 *qprops =
+		malloc(sizeof(VkQueueFamilyProperties2) * qcnt);
+	if (qprops == NULL)
+		err(1, "couldn't allocate for queue family properties");
+	for (size_t i = 0; i < qcnt; i++)
+		qprops[i] = (VkQueueFamilyProperties2){
+			.sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2,
+			.pNext = NULL,
+		};
+	vkGetPhysicalDeviceQueueFamilyProperties2(dev, &qcnt, qprops);
+	char found = 0;
+	for (size_t i = 0; i < qcnt; i++) {
+		VkQueueFlags flags = qprops[i].queueFamilyProperties.queueFlags;
+		if (flags & VK_QUEUE_GRAPHICS_BIT) {
+			found = 1;
+			break;
+		}
+	}
+	free(qprops);
+	return found;
 }
 
-char
+static char
 preferdev(VkPhysicalDeviceProperties2 new, VkPhysicalDeviceProperties2 old)
 {
 	if (old.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
@@ -61,6 +94,94 @@ preferdev(VkPhysicalDeviceProperties2 new, VkPhysicalDeviceProperties2 old)
 		return 1;
 
 	return 0;
+}
+
+enum stage {
+	INSTANCE,
+	DEVICE,
+	RENDER_PASS,
+	LAYOUT,
+	VERT_SHADER,
+	FRAG_SHADER,
+	SHADERS,
+	PIPELINE,
+};
+
+static void
+cleanup(enum stage s)
+{
+	switch (s) {
+	case PIPELINE:
+		vkDestroyPipeline(device, pipeline, NULL /* allocator */);
+	case SHADERS:
+        case FRAG_SHADER:
+		vkDestroyShaderModule(device, fragshader, NULL /* allocator */);
+	case VERT_SHADER:
+		vkDestroyShaderModule(device, vertshader, NULL /* allocator */);
+	case LAYOUT:
+		vkDestroyPipelineLayout(device, layout, NULL /* allocator */);
+	case RENDER_PASS:
+		vkDestroyRenderPass(device, renderpass, NULL /* allocator */);
+	case DEVICE:
+		vkDestroyDevice(device, NULL /* allocator */);
+	case INSTANCE:
+		vkDestroyInstance(instance, NULL /* allocator */);
+	}
+}
+
+static VkShaderModule
+readshader(const char *filename, enum stage toclean)
+{
+	FILE *f = fopen(filename, "rb");
+	if (f == NULL) {
+		cleanup(toclean);
+		err(1, "couldn't open shader file for reading");
+	}
+	if (fseek(f, 0, SEEK_END) < 0) {
+		cleanup(toclean);
+		err(1, "couldn't seek to end of shader file");
+	}
+	size_t codesz = ftell(f);
+	if (fseek(f, 0, SEEK_SET) < 0) {
+		cleanup(toclean);
+		err(1, "couldn't seek to start of shader file");
+	}
+	uint32_t *code = malloc(codesz);
+	if (code == NULL) {
+		cleanup(toclean);
+		err(1, "couldn't allocate for shader code");
+	}
+	/* TODO: is endianness an issue here? */
+	size_t num = fread(code, 1, codesz, f);
+	if (num != codesz) {
+		cleanup(toclean);
+		if (ferror(f))
+			err(1, "couldn't read shader code into buffer");
+	}
+	fclose(f);
+
+	VkShaderModule shader;
+	VkResult res;
+	res = vkCreateShaderModule(device, &(VkShaderModuleCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.codeSize = codesz,
+		.pCode = code,
+	}, NULL /* allocator */, &shader);
+	if (res != VK_SUCCESS) {
+		cleanup(toclean);
+		errx(1, "couldn't create shader module: %s", vkstrerror(res));
+	}
+
+	return shader;
+}
+
+static void
+keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
+{
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+                glfwSetWindowShouldClose(win, GLFW_TRUE);
 }
 
 int
@@ -78,7 +199,16 @@ main(void)
 
 	res = vkCreateInstance(&(VkInstanceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pNext = NULL,
+		.pNext = &(VkValidationFeaturesEXT) {
+			.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT,
+			.pNext = NULL,
+			.enabledValidationFeatureCount = 1,
+			.pEnabledValidationFeatures = (VkValidationFeatureEnableEXT[]){
+				VK_VALIDATION_FEATURE_ENABLE_BEST_PRACTICES_EXT,
+			},
+			.disabledValidationFeatureCount = 0,
+			.pDisabledValidationFeatures = NULL,
+		},
 		.flags = 0,
 		.pApplicationInfo = &(VkApplicationInfo) {
 			.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -89,46 +219,64 @@ main(void)
 			.engineVersion = 0,
 			.apiVersion = VK_MAKE_API_VERSION(0, 1, 1, 0),
 		},
-		.enabledLayerCount = 0,
-		.ppEnabledLayerNames = NULL,
-		.enabledExtensionCount = 0,
-		.ppEnabledExtensionNames = NULL,
+		.enabledLayerCount = 1,
+		.ppEnabledLayerNames = (const char *[]){
+			"VK_LAYER_KHRONOS_validation",
+		},
+		.enabledExtensionCount = 1,
+		.ppEnabledExtensionNames = (const char *[]){
+			"VK_EXT_validation_features",
+			"VK_EXT_layer_settings",
+		},
 	}, NULL /* allocator */, &instance);
 	if (res != VK_SUCCESS)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
-	if (res != VK_SUCCESS)
+	if (res != VK_SUCCESS) {
+		cleanup(INSTANCE);
 		errx(1, "coudln't get number of physical devices: %s",
 			vkstrerror(res));
+	}
 	VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * devcnt);
-	if (devs == NULL)
+	if (devs == NULL) {
+		cleanup(INSTANCE);
 		err(1, "couldn't allocate to store physical devices");
+	}
 	size_t devcap = devcnt;
 	while ((res = vkEnumeratePhysicalDevices(instance, &devcnt, devs))
 			== VK_INCOMPLETE) {
-		if (SIZE_T_MAX / 2 / sizeof(VkPhysicalDevice) > devcap)
+		if (SIZE_T_MAX / 2 / sizeof(VkPhysicalDevice) > devcap) {
+			cleanup(INSTANCE);
 			errx(1, "can't store %zu physical devices", devcap);
+		}
 		devcap *= 2;
 		VkPhysicalDevice *tmp =
 			realloc(devs, sizeof(VkPhysicalDevice) * devcap);
-		if (tmp == NULL)
+		if (tmp == NULL) {
+			cleanup(INSTANCE);
 			err(1, "coudln't allocate to store physical devices");
+		}
 		devs = tmp;
 		devcnt = devcap;
 	}
 
-	if (res != VK_SUCCESS)
+	if (res != VK_SUCCESS) {
+		cleanup(INSTANCE);
 		errx(1, "couldn't get physical devices: %s", vkstrerror(res));
+	}
 
 	VkPhysicalDevice dev;
 	VkPhysicalDeviceProperties2 devprops;
 	char found = 0;
 	for (size_t i = 0; i < devcnt; i++) {
-		VkPhysicalDeviceProperties2 props;
+		VkPhysicalDeviceProperties2 props = {
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+			.pNext = NULL,
+		};
 		vkGetPhysicalDeviceProperties2(devs[i], &props);
-		if (!usabledev(props))
+		if (!usabledev(devs[i], props))
 			continue;
 
 		if (!found) {
@@ -145,8 +293,10 @@ main(void)
 	}
 	free(devs);
 
-	if (!found)
+	if (!found) {
+		cleanup(INSTANCE);
 		errx(1, "couldn't find a compatible GPU");
+	}
 
 	res = vkCreateDevice(dev, &(VkDeviceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
@@ -160,10 +310,191 @@ main(void)
 		.ppEnabledExtensionNames = NULL,
 		.pEnabledFeatures = NULL,
 	}, NULL /* allocator */, &device);
-	if (res != VK_SUCCESS)
+	if (res != VK_SUCCESS) {
+		cleanup(INSTANCE);
 		errx(1, "couldn't create logical device: %s", vkstrerror(res));
+	}
 
-	vkDestroyDevice(device, NULL /* allocator */);
-	vkDestroyInstance(instance, NULL /* allocator */);
+	res = vkCreateRenderPass(device, &(VkRenderPassCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.attachmentCount = 0,
+		.pAttachments = NULL,
+		.subpassCount = 1,
+		.pSubpasses = &(VkSubpassDescription){
+			.flags = 0,
+			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.inputAttachmentCount = 0,
+			.pInputAttachments = NULL,
+			.colorAttachmentCount = 0,
+			.pResolveAttachments = NULL,
+			.pDepthStencilAttachment = NULL,
+			.preserveAttachmentCount = 0,
+			.pPreserveAttachments = NULL,
+		},
+		.dependencyCount = 0,
+		.pDependencies = NULL,
+	}, NULL /* allocator */, &renderpass);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "coudln't create render pass: %s", vkstrerror(res));
+	}
+
+	res = vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.setLayoutCount = 0,
+		.pSetLayouts = NULL,
+		.pushConstantRangeCount = 0,
+		.pPushConstantRanges = NULL,
+	}, NULL /* allocator */, &layout);
+	if (res != VK_SUCCESS) {
+		cleanup(RENDER_PASS);
+		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
+	}
+
+	vertshader = readshader("vert.spv", LAYOUT);
+	fragshader = readshader("frag.spv", VERT_SHADER);
+
+	res = vkCreateGraphicsPipelines(device, NULL /* cache */, 1,
+			&(VkGraphicsPipelineCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		.pNext = NULL,
+		/* TODO: */ .flags = 0,
+		.stageCount = 1,
+		.pStages = (VkPipelineShaderStageCreateInfo[]){
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .pNext = NULL,
+			  .flags = 0,
+			  .stage = VK_SHADER_STAGE_VERTEX_BIT,
+			  .module = vertshader,
+			  .pName = "main",
+			  .pSpecializationInfo = NULL,
+			},
+			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			  .pNext = NULL,
+			  .flags = 0,
+			  .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			  .module = fragshader,
+			  .pName = "main",
+			  .pSpecializationInfo = NULL,
+			},
+		},
+		.pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.vertexBindingDescriptionCount = 1,
+			.pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
+				.binding = 0,
+				.stride = 4*3,
+				.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+			},
+			.vertexAttributeDescriptionCount = 1,
+			.pVertexAttributeDescriptions = &(VkVertexInputAttributeDescription){
+				.location = 0,
+				.binding = 0,
+				.format = VK_FORMAT_R32G32B32_SFLOAT,
+				.offset = 0,
+			},
+		},
+		.pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+			.primitiveRestartEnable = VK_FALSE,
+		},
+		.pTessellationState = &(VkPipelineTessellationStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			/* TODO: */ .patchControlPoints = 1,
+		},
+		.pViewportState = &(VkPipelineViewportStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+			.pNext = 0,
+			.flags = 0,
+			.viewportCount = 1,
+			.pViewports = &(VkViewport){
+				.x = 0,
+				.y = 0,
+				.width = width,
+				.height = height,
+				.minDepth = 0.0,
+				.maxDepth = 1.0,
+			},
+			.scissorCount = 1,
+			.pScissors = &(VkRect2D){
+				.offset = (VkOffset2D){ .x = 0, .y = 0 },
+				.extent = (VkExtent2D){ .width = 0, .height = 0},
+			},
+		},
+		.pRasterizationState = &(VkPipelineRasterizationStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.depthClampEnable = VK_FALSE,
+			/* TODO: */ .rasterizerDiscardEnable = VK_TRUE,
+			.polygonMode = VK_POLYGON_MODE_FILL,
+			.cullMode = VK_CULL_MODE_BACK_BIT,
+			.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+			.depthBiasEnable = VK_FALSE,
+			.depthBiasConstantFactor = 0,
+			.depthBiasClamp = 0,
+			.depthBiasSlopeFactor = 0,
+			/* TODO: */ .lineWidth = 1.0,
+		},
+		.pMultisampleState = &(VkPipelineMultisampleStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+			.sampleShadingEnable = VK_FALSE,
+			.minSampleShading = 0,
+			.pSampleMask = NULL,
+			.alphaToCoverageEnable = VK_FALSE,
+			.alphaToOneEnable = VK_FALSE,
+		},
+		.pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.depthTestEnable = VK_FALSE,
+			.depthWriteEnable = VK_FALSE,
+			.depthCompareOp = 0,
+			.depthBoundsTestEnable = VK_FALSE,
+			.stencilTestEnable = VK_FALSE,
+			.front = { 0 },
+			.back = { 0 },
+			.minDepthBounds = 0,
+			.maxDepthBounds = 0,
+		},
+		.pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.logicOpEnable = VK_FALSE,
+			.logicOp = 0,
+			.attachmentCount = 0,
+			.pAttachments = NULL,
+			.blendConstants = { 0, 0, 0, 0 },
+		},
+		.pDynamicState = NULL,
+		.layout = layout,
+		.renderPass = renderpass,
+		.subpass = 0,
+		.basePipelineHandle = 0,
+		.basePipelineIndex = 0,
+	}, NULL /* allocator */, &pipeline);
+	if (res != VK_SUCCESS) {
+		cleanup(SHADERS);
+		errx(1, "couldn't create graphics pipeline: %s",
+			vkstrerror(res));
+	}
+
+	cleanup(PIPELINE);
 	return 0;
 }
