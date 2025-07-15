@@ -3,10 +3,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
+#define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
-#include <vulkan/vulkan.h>
 
+#define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
 #define SIZE_T_MAX ((size_t)-1)
 
 static const char *progname = "My Little Vulkan App";
@@ -20,6 +22,8 @@ static VkPipelineLayout layout;
 static VkShaderModule vertshader;
 static VkShaderModule fragshader;
 static VkPipeline pipeline;
+static VkSurfaceKHR surface;
+static VkSwapchainKHR swapchain;
 
 static const char *
 vkstrerror(VkResult res)
@@ -44,6 +48,8 @@ vkstrerror(VkResult res)
 	case VK_ERROR_FORMAT_NOT_SUPPORTED: return "format not supported";
 	case VK_ERROR_FRAGMENTED_POOL: return "fragmented pool";
 	case VK_ERROR_UNKNOWN: return "unkown error";
+	case VK_ERROR_SURFACE_LOST_KHR: return "surface lost";
+	case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "native window in use";
 	default: return "<bad error code>";
 	}
 }
@@ -74,7 +80,10 @@ usabledev(VkPhysicalDevice dev, VkPhysicalDeviceProperties2 props)
 	char found = 0;
 	for (size_t i = 0; i < qcnt; i++) {
 		VkQueueFlags flags = qprops[i].queueFamilyProperties.queueFlags;
-		if (flags & VK_QUEUE_GRAPHICS_BIT) {
+		if (!(flags & VK_QUEUE_GRAPHICS_BIT))
+			continue;
+		if (glfwGetPhysicalDevicePresentationSupport(
+				instance, dev, i)) {
 			found = 1;
 			break;
 		}
@@ -99,6 +108,8 @@ preferdev(VkPhysicalDeviceProperties2 new, VkPhysicalDeviceProperties2 old)
 enum stage {
 	INSTANCE,
 	DEVICE,
+	SURFACE,
+	SWAP_CHAIN,
 	RENDER_PASS,
 	LAYOUT,
 	VERT_SHADER,
@@ -122,6 +133,10 @@ cleanup(enum stage s)
 		vkDestroyPipelineLayout(device, layout, NULL /* allocator */);
 	case RENDER_PASS:
 		vkDestroyRenderPass(device, renderpass, NULL /* allocator */);
+	case SWAP_CHAIN:
+		vkDestroySwapchainKHR(device, swapchain, NULL /* allocator */);
+	case SURFACE:
+		vkDestroySurfaceKHR(instance, surface, NULL /* allocator */);
 	case DEVICE:
 		vkDestroyDevice(device, NULL /* allocator */);
 	case INSTANCE:
@@ -180,7 +195,10 @@ readshader(const char *filename, enum stage toclean)
 static void
 keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 {
-        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
+        (void)scancode;
+        (void)mods;
+        if ((key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
+            		&& action == GLFW_PRESS)
                 glfwSetWindowShouldClose(win, GLFW_TRUE);
 }
 
@@ -189,14 +207,45 @@ main(void)
 {
 	VkResult res;
 
+	if (!glfwInit()) {
+        	const char *msg;
+        	(void)glfwGetError(&msg);
+        	errx(1, "couldn't initialise GLFW context: %s", msg);
+        }
+
+        /* TODO: set the error callback and figure out how I want to use it */
+
+        if (!glfwVulkanSupported())
+	        errx(1, "vulkan not supported by GLFW");
+
 	uint32_t apiver;
 	res = vkEnumerateInstanceVersion(&apiver);
 	if (res != VK_SUCCESS)
 		errx(1, "coudln't determine vulkan API version");
 	if (VK_API_VERSION_MAJOR(apiver) != 1 ||
 			VK_API_VERSION_MINOR(apiver) < 1)
-		errx(1, "only compatible with version 1.1 of vulkan");
+		errx(1, "requires compatibility with version 1.1 of vulkan");
 
+	const char *manualexts[] = {
+		"VK_KHR_swapchain",
+		"VK_KHR_surface",
+		"VK_EXT_validation_features",
+		"VK_EXT_layer_settings",
+	};
+	uint32_t numglfwexts;
+	const char **glfwexts = glfwGetRequiredInstanceExtensions(&numglfwexts);
+	if (numglfwexts == 0) {
+		const char *msg;
+		(void)glfwGetError(&msg);
+		errx(1, "couldn't get required vulkan extensions: %s", msg);
+	}
+	/* TODO: technically can overflow */
+	const char **exts = malloc(
+		sizeof(char **) * (numglfwexts + ARR_SZ(manualexts)));
+	if (exts == NULL)
+		err(1, "couldn't allocate for instance extensions");
+	memcpy(exts, glfwexts, sizeof(char *)*numglfwexts);
+	memcpy(exts+numglfwexts, manualexts, sizeof(manualexts));
 	res = vkCreateInstance(&(VkInstanceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 		.pNext = &(VkValidationFeaturesEXT) {
@@ -223,12 +272,10 @@ main(void)
 		.ppEnabledLayerNames = (const char *[]){
 			"VK_LAYER_KHRONOS_validation",
 		},
-		.enabledExtensionCount = 1,
-		.ppEnabledExtensionNames = (const char *[]){
-			"VK_EXT_validation_features",
-			"VK_EXT_layer_settings",
-		},
+		.enabledExtensionCount = numglfwexts + ARR_SZ(manualexts),
+		.ppEnabledExtensionNames = exts,
 	}, NULL /* allocator */, &instance);
+	free(exts);
 	if (res != VK_SUCCESS)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
@@ -315,6 +362,54 @@ main(void)
 		errx(1, "couldn't create logical device: %s", vkstrerror(res));
 	}
 
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	GLFWwindow *window = glfwCreateWindow(
+        	width, height, progname, NULL, NULL);
+	if (window == NULL) {
+        	const char *msg;
+        	(void)glfwGetError(&msg);
+        	glfwTerminate();
+        	cleanup(DEVICE);
+        	errx(1, "couldn't create a GLFW window: %s", msg);
+	}
+
+	res = glfwCreateWindowSurface(
+		instance, window, NULL /* allocator */, &surface);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't create surface for window: %s",
+			vkstrerror(res));
+	}
+
+	res = vkCreateSwapchainKHR(device, &(VkSwapchainCreateInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+		.pNext = NULL,
+		.flags = 0,
+		.surface = surface,
+		.minImageCount = 1,
+		.imageFormat = VK_FORMAT_R8G8B8A8_UINT,
+		.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+		.imageExtent = {
+			.width = width,
+			.height = height,
+		},
+		.imageArrayLayers = 1,
+		.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 0,
+		.pQueueFamilyIndices = NULL,
+		.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+		.presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
+		.clipped = VK_TRUE,
+		.oldSwapchain = VK_NULL_HANDLE,
+	}, NULL /* allocator */, &swapchain);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
+	}
+
 	res = vkCreateRenderPass(device, &(VkRenderPassCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
 		.pNext = NULL,
@@ -337,7 +432,7 @@ main(void)
 		.pDependencies = NULL,
 	}, NULL /* allocator */, &renderpass);
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanup(SWAP_CHAIN);
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
 	}
 
@@ -495,6 +590,12 @@ main(void)
 			vkstrerror(res));
 	}
 
+	glfwSetKeyCallback(window, &keycb);
+	while (!glfwWindowShouldClose(window))
+        	;
+	glfwDestroyWindow(window);
+
+	glfwTerminate();
 	cleanup(PIPELINE);
 	return 0;
 }
