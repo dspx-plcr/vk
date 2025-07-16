@@ -1,6 +1,6 @@
 .SUFFIXES: .glsl .spv
 
-CFLAGS = -std=c99 -pedantic -Wall -Wextra -g
+CFLAGS = -std=gnu99 -pedantic -Wall -Wextra -g
 LDFLAGS = -lvulkan -lm -lglfw
 TARGET = vk
 

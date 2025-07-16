@@ -4,12 +4,35 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
-#define SIZE_T_MAX ((size_t)-1)
+//#define SIZE_T_MAX ((size_t)-1)
+#define SIZE_T_MAX SIZE_MAX
+#define min(a, b) ((a) < (b) ? (a) : (b))
+#define max(a, b) ((a) > (b) ? (a) : (b))
+
+struct display {
+	GLFWwindow *window;
+	VkSurfaceKHR surface;
+	VkSwapchainKHR swapchain;
+	VkSemaphore *semaphores;
+	size_t nsems;
+	VkImage *images;
+	size_t nims;
+	VkImageView *views;
+	size_t nviews;
+	VkFramebuffer *framebuffers;
+	size_t nfbs;
+
+	VkSurfaceCapabilitiesKHR caps;
+	VkSurfaceFormatKHR fmt;
+	VkPresentModeKHR mode;
+	
+};
 
 static const char *progname = "My Little Vulkan App";
 static const float width = 1920;
@@ -17,13 +40,20 @@ static const float height = 1080;
 
 static VkInstance instance;
 static VkDevice device;
+static uint32_t qfamidx;
+static struct display display;
 static VkRenderPass renderpass;
+static VkDescriptorSetLayout dsetlayout;
+static VkDescriptorPool dpool;
 static VkPipelineLayout layout;
 static VkShaderModule vertshader;
 static VkShaderModule fragshader;
 static VkPipeline pipeline;
-static VkSurfaceKHR surface;
-static VkSwapchainKHR swapchain;
+static VkCommandPool pool;
+static VkDeviceMemory memory;
+static VkBuffer buffer;
+static VkFence fence;
+static VkSemaphore acquiresem;
 
 static const char *
 vkstrerror(VkResult res)
@@ -85,6 +115,7 @@ usabledev(VkPhysicalDevice dev, VkPhysicalDeviceProperties2 props)
 		if (glfwGetPhysicalDevicePresentationSupport(
 				instance, dev, i)) {
 			found = 1;
+			qfamidx = i;
 			break;
 		}
 	}
@@ -107,21 +138,49 @@ preferdev(VkPhysicalDeviceProperties2 new, VkPhysicalDeviceProperties2 old)
 
 enum stage {
 	INSTANCE,
-	DEVICE,
 	SURFACE,
+	DEVICE,
 	SWAP_CHAIN,
+	SEMAPHORES,
+	IMAGE_VIEWS,
 	RENDER_PASS,
+	FRAMEBUFFERS,
+	DESCRIPTOR_SET_LAYOUT,
 	LAYOUT,
 	VERT_SHADER,
 	FRAG_SHADER,
 	SHADERS,
 	PIPELINE,
+	POOL,
+	DESCRIPTOR_POOL,
+	BUFFER,
+	DEVICE_MEMORY,
+	FENCE,
+	ACQUIRE_SEMAPHORE,
+	ALL,
 };
 
 static void
 cleanup(enum stage s)
 {
+	VkQueue queue;
+	vkGetDeviceQueue(device, qfamidx, 0, &queue);
+	vkQueueWaitIdle(queue);
+	vkDeviceWaitIdle(device);
 	switch (s) {
+	case ALL:
+	case ACQUIRE_SEMAPHORE:
+		vkDestroySemaphore(device, acquiresem, NULL /* allocator */);
+	case FENCE:
+		vkDestroyFence(device, fence, NULL /* allocator */);
+	case DEVICE_MEMORY:
+		vkFreeMemory(device, memory, NULL /* allocator */);
+	case BUFFER:
+		vkDestroyBuffer(device, buffer, NULL /* allocator */);
+	case DESCRIPTOR_POOL:
+		vkDestroyDescriptorPool(device, dpool, NULL /* allocator */);
+	case POOL:
+		vkDestroyCommandPool(device, pool, NULL /* allocator */);
 	case PIPELINE:
 		vkDestroyPipeline(device, pipeline, NULL /* allocator */);
 	case SHADERS:
@@ -131,14 +190,34 @@ cleanup(enum stage s)
 		vkDestroyShaderModule(device, vertshader, NULL /* allocator */);
 	case LAYOUT:
 		vkDestroyPipelineLayout(device, layout, NULL /* allocator */);
+	case DESCRIPTOR_SET_LAYOUT:
+		vkDestroyDescriptorSetLayout(
+			device, dsetlayout, NULL /* allocator */);
+	case FRAMEBUFFERS:
+		for (size_t i = 0; i < display.nfbs; i++)
+			vkDestroyFramebuffer(device, display.framebuffers[i],
+				NULL /* allocator */);
+		display.nfbs = 0;
 	case RENDER_PASS:
 		vkDestroyRenderPass(device, renderpass, NULL /* allocator */);
+	case IMAGE_VIEWS:
+		for (size_t i = 0; i < display.nviews; i++)
+			vkDestroyImageView(device, display.views[i],
+				NULL /* allocator */);
+		display.nviews = 0;
+	case SEMAPHORES:
+		for (size_t i = 0; i < display.nsems; i++)
+			vkDestroySemaphore(device, display.semaphores[i],
+				NULL /* allocator */);
+		display.nsems = 0;
 	case SWAP_CHAIN:
-		vkDestroySwapchainKHR(device, swapchain, NULL /* allocator */);
-	case SURFACE:
-		vkDestroySurfaceKHR(instance, surface, NULL /* allocator */);
+		vkDestroySwapchainKHR(
+			device, display.swapchain, NULL /* allocator */);
 	case DEVICE:
 		vkDestroyDevice(device, NULL /* allocator */);
+	case SURFACE:
+		vkDestroySurfaceKHR(
+			instance, display.surface, NULL /* allocator */);
 	case INSTANCE:
 		vkDestroyInstance(instance, NULL /* allocator */);
 	}
@@ -202,8 +281,8 @@ keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
                 glfwSetWindowShouldClose(win, GLFW_TRUE);
 }
 
-int
-main(void)
+static void
+setup(void)
 {
 	VkResult res;
 
@@ -227,9 +306,8 @@ main(void)
 		errx(1, "requires compatibility with version 1.1 of vulkan");
 
 	const char *manualexts[] = {
-		"VK_KHR_swapchain",
 		"VK_KHR_surface",
-		"VK_EXT_validation_features",
+		"VK_KHR_get_surface_capabilities2",
 		"VK_EXT_layer_settings",
 	};
 	uint32_t numglfwexts;
@@ -279,6 +357,26 @@ main(void)
 	if (res != VK_SUCCESS)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
+	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	display.window = glfwCreateWindow(
+        	width, height, progname, NULL, NULL);
+	if (display.window == NULL) {
+        	const char *msg;
+        	(void)glfwGetError(&msg);
+        	glfwTerminate();
+        	cleanup(INSTANCE);
+        	errx(1, "couldn't create a GLFW window: %s", msg);
+	}
+
+	res = glfwCreateWindowSurface(instance, display.window,
+		NULL /* allocator */, &display.surface);
+	if (res != VK_SUCCESS) {
+		cleanup(INSTANCE);
+		errx(1, "couldn't create surface for window: %s",
+			vkstrerror(res));
+	}
+	glfwSetKeyCallback(display.window, &keycb);
+
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
 	if (res != VK_SUCCESS) {
@@ -299,8 +397,8 @@ main(void)
 			errx(1, "can't store %zu physical devices", devcap);
 		}
 		devcap *= 2;
-		VkPhysicalDevice *tmp =
-			realloc(devs, sizeof(VkPhysicalDevice) * devcap);
+		VkPhysicalDevice *tmp = realloc(
+			devs, sizeof(VkPhysicalDevice) * devcap);
 		if (tmp == NULL) {
 			cleanup(INSTANCE);
 			err(1, "coudln't allocate to store physical devices");
@@ -308,13 +406,12 @@ main(void)
 		devs = tmp;
 		devcnt = devcap;
 	}
-
 	if (res != VK_SUCCESS) {
 		cleanup(INSTANCE);
 		errx(1, "couldn't get physical devices: %s", vkstrerror(res));
 	}
 
-	VkPhysicalDevice dev;
+	VkPhysicalDevice physdev;
 	VkPhysicalDeviceProperties2 devprops;
 	char found = 0;
 	for (size_t i = 0; i < devcnt; i++) {
@@ -327,14 +424,14 @@ main(void)
 			continue;
 
 		if (!found) {
-			dev = devs[i];
+			physdev = devs[i];
 			devprops = props;
 			found = 1;
 			continue;
 		}
 
 		if (preferdev(props, devprops)) {
-			dev = devs[i];
+			physdev = devs[i];
 			devprops = props;
 		}
 	}
@@ -345,16 +442,25 @@ main(void)
 		errx(1, "couldn't find a compatible GPU");
 	}
 
-	res = vkCreateDevice(dev, &(VkDeviceCreateInfo){
+	const char *devexts[] = {
+		"VK_KHR_swapchain",
+	};
+	res = vkCreateDevice(physdev, &(VkDeviceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.queueCreateInfoCount = 0,
-		.pQueueCreateInfos = NULL,
-		.enabledLayerCount = 0,
-		.ppEnabledLayerNames = NULL,
-		.enabledExtensionCount = 0,
-		.ppEnabledExtensionNames = NULL,
+		.queueCreateInfoCount = 1,
+		.pQueueCreateInfos = (const VkDeviceQueueCreateInfo[]){ {
+				.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+				.pNext = NULL,
+				.flags = 0,
+				.queueFamilyIndex = qfamidx,
+				.queueCount = 1,
+				.pQueuePriorities = (const float[]) { 0.0 },
+			},
+		},
+		.enabledExtensionCount = ARR_SZ(devexts),
+		.ppEnabledExtensionNames = devexts,
 		.pEnabledFeatures = NULL,
 	}, NULL /* allocator */, &device);
 	if (res != VK_SUCCESS) {
@@ -362,67 +468,257 @@ main(void)
 		errx(1, "couldn't create logical device: %s", vkstrerror(res));
 	}
 
-	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	GLFWwindow *window = glfwCreateWindow(
-        	width, height, progname, NULL, NULL);
-	if (window == NULL) {
-        	const char *msg;
-        	(void)glfwGetError(&msg);
-        	glfwTerminate();
-        	cleanup(DEVICE);
-        	errx(1, "couldn't create a GLFW window: %s", msg);
-	}
-
-	res = glfwCreateWindowSurface(
-		instance, window, NULL /* allocator */, &surface);
+	VkSurfaceCapabilitiesKHR caps;
+	res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+		physdev, display.surface, &caps);
 	if (res != VK_SUCCESS) {
 		cleanup(DEVICE);
-		errx(1, "couldn't create surface for window: %s",
+		errx(1, "couldn't query for surface capabilities: %s",
 			vkstrerror(res));
 	}
+
+	VkPhysicalDeviceSurfaceInfo2KHR surfinfo = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+		.pNext = NULL,
+		.surface = display.surface,
+	};
+	uint32_t fmtcnt;
+	res = vkGetPhysicalDeviceSurfaceFormats2KHR(
+		physdev, &surfinfo, &fmtcnt, NULL);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't query for surface formats: %s",
+			vkstrerror(res));
+	}
+	size_t fmtcap = fmtcnt;
+	/* TODO: can overflow */
+	VkSurfaceFormat2KHR *fmts = malloc(sizeof(VkSurfaceFormat2KHR)*fmtcap);
+	if (fmts == NULL) {
+		cleanup(DEVICE);
+		err(1, "couldn't allocate for surface formats");
+	}
+	for (size_t i = 0; i < fmtcnt; i++)
+		fmts[i] = (VkSurfaceFormat2KHR){
+			.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR,
+			.pNext = NULL,
+		};
+	while ((res = vkGetPhysicalDeviceSurfaceFormats2KHR(
+			physdev, &surfinfo, &fmtcnt, fmts))
+	       		== VK_INCOMPLETE) {
+		if (SIZE_T_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
+			cleanup(DEVICE);
+			errx(1, "can't store %zu physical devices", fmtcap);
+		}
+		fmtcap *= 2;
+		VkSurfaceFormat2KHR *tmp = realloc(
+			fmts, sizeof(VkSurfaceFormat2KHR) * fmtcap);
+		if (tmp == NULL) {
+			cleanup(DEVICE);
+			err(1, "coudln't allocate to store surface formats");
+		}
+		fmts = tmp;
+		for (size_t i = fmtcnt; i < fmtcap; i++)
+			fmts[i] = (VkSurfaceFormat2KHR){
+				.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR,
+				.pNext = NULL,
+			};
+		fmtcnt = fmtcap;
+	}
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
+	}
+
+	uint32_t modecnt;
+	res = vkGetPhysicalDeviceSurfacePresentModesKHR(
+		physdev, display.surface, &modecnt, NULL);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't query for surface formats: %s",
+			vkstrerror(res));
+	}
+	size_t modecap = modecnt;
+	/* TODO: can overflow */
+	VkPresentModeKHR *modes = malloc(sizeof(VkPresentModeKHR)*modecap);
+	if (modes == NULL) {
+		cleanup(DEVICE);
+		err(1, "couldn't allocate for surface formats");
+	}
+	while ((res = vkGetPhysicalDeviceSurfacePresentModesKHR(
+			physdev, display.surface, &modecnt, modes))
+	       		== VK_INCOMPLETE) {
+		if (SIZE_T_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
+			cleanup(DEVICE);
+			errx(1, "can't store %zu physical devices", modecap);
+		}
+		modecap *= 2;
+		VkPresentModeKHR *tmp = realloc(
+			modes, sizeof(VkPresentModeKHR) * modecap);
+		if (tmp == NULL) {
+			cleanup(DEVICE);
+			err(1, "coudln't allocate to store surface formats");
+		}
+		modes = tmp;
+		modecnt = modecap;
+	}
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE);
+		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
+	}
+
+	display.caps = caps;
+	display.fmt = fmts[0].surfaceFormat;
+	display.mode = modes[0];
+	free(fmts);
+	free(modes);
 
 	res = vkCreateSwapchainKHR(device, &(VkSwapchainCreateInfoKHR){
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.pNext = NULL,
 		.flags = 0,
-		.surface = surface,
-		.minImageCount = 1,
-		.imageFormat = VK_FORMAT_R8G8B8A8_UINT,
-		.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+		.surface = display.surface,
+		.minImageCount = display.caps.minImageCount,
+		.imageFormat = display.fmt.format,
+		.imageColorSpace = display.fmt.colorSpace,
+		/* TODO: check caps */
 		.imageExtent = {
 			.width = width,
 			.height = height,
 		},
 		.imageArrayLayers = 1,
+		/* TODO: check caps */
 		.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
 			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-		.queueFamilyIndexCount = 0,
-		.pQueueFamilyIndices = NULL,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (const uint32_t[]){ qfamidx },
 		.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+		/* TODO: check caps */
 		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-		.presentMode = VK_PRESENT_MODE_MAILBOX_KHR,
+		.presentMode = display.mode,
 		.clipped = VK_TRUE,
 		.oldSwapchain = VK_NULL_HANDLE,
-	}, NULL /* allocator */, &swapchain);
+	}, NULL /* allocator */, &display.swapchain);
 	if (res != VK_SUCCESS) {
 		cleanup(DEVICE);
 		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
+	}
+
+	uint32_t imcnt;
+	res = vkGetSwapchainImagesKHR(device, display.swapchain, &imcnt, NULL);
+	if (res != VK_SUCCESS) {
+		cleanup(SWAP_CHAIN);
+		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
+	}
+	size_t imcap = imcnt;
+	/* TODO: can overflow */
+	VkImage *ims = malloc(sizeof(VkImage) * imcap);
+	if (ims == NULL) {
+		cleanup(SWAP_CHAIN);
+		err(1, "couldn't allocate memory for images");
+	}
+	while ((res = vkGetSwapchainImagesKHR(
+			device, display.swapchain, &imcnt, ims))
+	       		== VK_INCOMPLETE) {
+		if (SIZE_T_MAX / 2 / sizeof(VkImage) > imcap) {
+			cleanup(SWAP_CHAIN);
+			errx(1, "can't store %zu physical devices", imcap);
+		}
+		imcap *= 2;
+		VkImage *tmp = realloc(modes, sizeof(VkImage) * imcap);
+		if (tmp == NULL) {
+			cleanup(SWAP_CHAIN);
+			err(1, "coudln't allocate to store surface formats");
+		}
+		ims = tmp;
+		imcnt = imcap;
+	}
+	display.images = ims;
+	display.nims = imcnt;
+
+	display.semaphores = malloc(sizeof(VkSemaphore) * imcnt);
+	if (display.semaphores == NULL) {
+		cleanup(SWAP_CHAIN);
+		err(1, "couldn't allocate for semaphores");
+	}
+	display.nsems = 0;
+	for (size_t i = 0; i < display.nims; i++) {
+		res = vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+		}, NULL /* allocator */, display.semaphores+i);
+		if (res != VK_SUCCESS) {
+			cleanup(SEMAPHORES);
+			errx(1, "couldn't create semaphore: %s", vkstrerror(res));
+		}
+		display.nsems++;
+	}
+
+	display.views = malloc(sizeof(VkImageView) * display.nims);
+	if (display.views == NULL) {
+		cleanup(SEMAPHORES);
+		err(1, "couldn't allocate for image views");
+	}
+	display.nviews = 0;
+	for (size_t i = 0; i < imcnt; i++) {
+		res = vkCreateImageView(device, &(VkImageViewCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.image = display.images[i],
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = display.fmt.format,
+			.components =  {
+				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+			},
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			}
+		}, NULL /* allocator */, display.views+i);
+		if (res != VK_SUCCESS) {
+			cleanup(IMAGE_VIEWS);
+			errx(1, "couldn't create image view: %s", vkstrerror(res));
+		}
+		display.nviews++;
 	}
 
 	res = vkCreateRenderPass(device, &(VkRenderPassCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.attachmentCount = 0,
-		.pAttachments = NULL,
+		.attachmentCount = 1,
+		.pAttachments = (const VkAttachmentDescription[]){ {
+				.flags = 0,
+				.format = display.fmt.format,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			},
+		},
 		.subpassCount = 1,
 		.pSubpasses = &(VkSubpassDescription){
 			.flags = 0,
 			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
 			.inputAttachmentCount = 0,
 			.pInputAttachments = NULL,
-			.colorAttachmentCount = 0,
+			.colorAttachmentCount = 1,
+			.pColorAttachments = (VkAttachmentReference[]){ {
+					.attachment = 0,
+					.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				},
+			 },
 			.pResolveAttachments = NULL,
 			.pDepthStencilAttachment = NULL,
 			.preserveAttachmentCount = 0,
@@ -432,21 +728,71 @@ main(void)
 		.pDependencies = NULL,
 	}, NULL /* allocator */, &renderpass);
 	if (res != VK_SUCCESS) {
-		cleanup(SWAP_CHAIN);
+		cleanup(IMAGE_VIEWS);
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
+	}
+
+	display.framebuffers = malloc(sizeof(VkFramebuffer) * imcnt);
+	if (display.framebuffers == NULL) {
+		cleanup(IMAGE_VIEWS);
+		err(1, "couldn't not allocate for framebuffers");
+	}
+	display.nfbs = 0;
+	for (size_t i = 0; i < imcnt; i++) {
+		res = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.renderPass = renderpass,
+			.attachmentCount = 1,
+			.pAttachments = (VkImageView[]) {
+				display.views[i],
+			},
+			.width = width,
+			.height = height,
+			.layers = 1,
+		}, NULL /* allocator */, display.framebuffers+i);
+		if (res != VK_SUCCESS) {
+			cleanup(FRAMEBUFFERS);
+			errx(1, "coudln't allocate frame buffer: %s",
+				vkstrerror(res));
+		}
+		display.nfbs++;
+	}
+
+	res = vkCreateDescriptorSetLayout(device, &(VkDescriptorSetLayoutCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.bindingCount = 1,
+		.pBindings = (VkDescriptorSetLayoutBinding[]){ {
+				.binding = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				.pImmutableSamplers = NULL,
+			},
+		},
+	}, NULL /* allocator */, &dsetlayout);
+	if (res != VK_SUCCESS) {
+		cleanup(FRAMEBUFFERS);
+		errx(1, "couldn't allocate descriptor set layout: %s",
+			vkstrerror(res));
 	}
 
 	res = vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.setLayoutCount = 0,
-		.pSetLayouts = NULL,
+		.setLayoutCount = 1,
+		.pSetLayouts = (VkDescriptorSetLayout[]){
+			dsetlayout,
+		},
 		.pushConstantRangeCount = 0,
 		.pPushConstantRanges = NULL,
 	}, NULL /* allocator */, &layout);
 	if (res != VK_SUCCESS) {
-		cleanup(RENDER_PASS);
+		cleanup(DESCRIPTOR_SET_LAYOUT);
 		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
 	}
 
@@ -458,23 +804,23 @@ main(void)
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
 		.pNext = NULL,
 		/* TODO: */ .flags = 0,
-		.stageCount = 1,
-		.pStages = (VkPipelineShaderStageCreateInfo[]){
-			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			  .pNext = NULL,
-			  .flags = 0,
-			  .stage = VK_SHADER_STAGE_VERTEX_BIT,
-			  .module = vertshader,
-			  .pName = "main",
-			  .pSpecializationInfo = NULL,
-			},
-			{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-			  .pNext = NULL,
-			  .flags = 0,
-			  .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-			  .module = fragshader,
-			  .pName = "main",
-			  .pSpecializationInfo = NULL,
+		.stageCount = 2,
+		.pStages = (VkPipelineShaderStageCreateInfo[]){ {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.pNext = NULL,
+				.flags = 0,
+				.stage = VK_SHADER_STAGE_VERTEX_BIT,
+				.module = vertshader,
+				.pName = "main",
+				.pSpecializationInfo = NULL,
+			}, {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			 	.pNext = NULL,
+			 	.flags = 0,
+			 	.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			 	.module = fragshader,
+			 	.pName = "main",
+			 	.pSpecializationInfo = NULL,
 			},
 		},
 		.pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
@@ -532,7 +878,7 @@ main(void)
 			.pNext = NULL,
 			.flags = 0,
 			.depthClampEnable = VK_FALSE,
-			/* TODO: */ .rasterizerDiscardEnable = VK_TRUE,
+			.rasterizerDiscardEnable = VK_FALSE,
 			.polygonMode = VK_POLYGON_MODE_FILL,
 			.cullMode = VK_CULL_MODE_BACK_BIT,
 			.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
@@ -573,8 +919,20 @@ main(void)
 			.flags = 0,
 			.logicOpEnable = VK_FALSE,
 			.logicOp = 0,
-			.attachmentCount = 0,
-			.pAttachments = NULL,
+			.attachmentCount = 1,
+			.pAttachments = &(VkPipelineColorBlendAttachmentState){
+				.blendEnable = VK_FALSE,
+				.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
+				.dstColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
+				.colorBlendOp = VK_BLEND_OP_MAX,
+				.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
+				.dstAlphaBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
+				.alphaBlendOp = VK_BLEND_OP_MAX,
+				.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+					VK_COLOR_COMPONENT_G_BIT |
+					VK_COLOR_COMPONENT_B_BIT |
+					VK_COLOR_COMPONENT_A_BIT,
+			},
 			.blendConstants = { 0, 0, 0, 0 },
 		},
 		.pDynamicState = NULL,
@@ -590,12 +948,271 @@ main(void)
 			vkstrerror(res));
 	}
 
-	glfwSetKeyCallback(window, &keycb);
-	while (!glfwWindowShouldClose(window))
-        	;
-	glfwDestroyWindow(window);
+	res = vkCreateCommandPool(device, &(VkCommandPoolCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		.pNext = NULL,
+		.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+		.queueFamilyIndex = qfamidx,
+	}, NULL /* allocator */, &pool);
+	if (res != VK_SUCCESS) {
+		cleanup(PIPELINE);
+		errx(1, "couldn't allocate command pool: %s", vkstrerror(res));
+	}
 
+	res = vkCreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.maxSets = 1,
+		.poolSizeCount = 1,
+		.pPoolSizes = (VkDescriptorPoolSize[]){ {
+				.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.descriptorCount = 1,
+			},
+		},
+	}, NULL /* allocator */, &dpool);
+	if (res != VK_SUCCESS) {
+		cleanup(POOL);
+		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
+	}
+
+	/* TODO: Do this during usabledev */
+	VkPhysicalDeviceMemoryProperties2 memprops = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+		.pNext = NULL,
+	};
+	vkGetPhysicalDeviceMemoryProperties2(physdev, &memprops);
+	int64_t memidx = -1;
+	for (size_t i = 0; i < memprops.memoryProperties.memoryTypeCount; i++) {
+		VkMemoryPropertyFlags flags =
+			memprops.memoryProperties.memoryTypes[i].propertyFlags;
+		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+				(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+			memidx = i;
+			break;
+		}
+	}
+	if (memidx < 0) {
+		cleanup(DESCRIPTOR_POOL);
+		errx(1, "couldn't find usable device memory");
+	}
+
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = sizeof(float)*3*3,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) {
+			qfamidx,
+		},
+	}, NULL /* allocator */, &buffer);
+	if (res != VK_SUCCESS) {
+		cleanup(DESCRIPTOR_POOL);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	VkMemoryRequirements memreq;
+	vkGetBufferMemoryRequirements(device, buffer, &memreq);
+	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = NULL,
+		.allocationSize = max(memreq.size, sizeof(float)*3*3),
+		.memoryTypeIndex = (uint32_t)memidx,
+	}, NULL /* allocator */, &memory);
+	if (res != VK_SUCCESS) {
+		cleanup(BUFFER);
+		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
+	}
+
+	res = vkBindBufferMemory(device, buffer, memory, 0);
+	if (res != VK_SUCCESS) {
+		cleanup(DEVICE_MEMORY);
+		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
+	}
+
+	res = vkCreateFence(device, &(VkFenceCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+	}, NULL /* allocator */, &fence);
+	if (res != VK_SUCCESS) {
+		cleanup(BUFFER);
+		errx(1, "couldn't create fence: %s", vkstrerror(res));
+	}
+
+	res = vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+	}, NULL /* allocator */, &acquiresem);
+	if (res != VK_SUCCESS) {
+		cleanup(FENCE);
+		errx(1, "couldn't create semaphore: %s", vkstrerror(res));
+	}
+}
+
+static void
+teardown(void)
+{
+	cleanup(ALL);
+	glfwDestroyWindow(display.window);
 	glfwTerminate();
-	cleanup(PIPELINE);
+}
+
+static void
+render(void)
+{
+	VkResult res;
+
+	uint32_t idx;
+	res = vkAcquireNextImage2KHR(device, &(VkAcquireNextImageInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
+		.pNext = NULL,
+		.swapchain = display.swapchain,
+		.timeout = 0,
+		.semaphore = acquiresem,
+		.fence = VK_NULL_HANDLE,
+		.deviceMask = 1,
+	}, &idx);
+	if (res != VK_SUCCESS) {
+		warnx("couldn't acquire image for presentation");
+		return;
+	}
+
+	VkCommandBuffer buf;
+	res = vkAllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.pNext = NULL,
+		.commandPool = pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	}, &buf);
+	if (res != VK_SUCCESS) {
+		warnx("couldn't get a command buffer: %s", vkstrerror(res));
+		return;
+	}
+
+	VkDescriptorSet dset;
+	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.pNext = NULL,
+		.descriptorPool = dpool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = (VkDescriptorSetLayout[]){
+			dsetlayout,
+		}
+	}, &dset);
+	if (res != VK_SUCCESS) {
+		warnx("couldn't get a descriptor set: %s", vkstrerror(res));
+		goto free_buf;
+	}
+
+	res = vkBeginCommandBuffer(buf, &(VkCommandBufferBeginInfo){
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+		.pNext = NULL,
+		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+		.pInheritanceInfo = NULL,
+	});
+	if (res != VK_SUCCESS) {
+		warnx("couldn't begin command buffer: %s", vkstrerror(res));
+		goto free_dset;
+	}
+
+	vkCmdBindDescriptorSets(buf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+		0, 1, &dset, 0, NULL);
+	vkCmdBindPipeline(buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	vkCmdBindVertexBuffers(buf, 0, 1, (VkBuffer[]){
+		buffer,
+	}, (VkDeviceSize[]){
+		0,
+	});
+	vkCmdBeginRenderPass(buf, &(VkRenderPassBeginInfo){
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+		.pNext = NULL,
+		.renderPass = renderpass,
+		.framebuffer = display.framebuffers[idx],
+		.renderArea = {
+			.offset = { .x = 0, .y = 0 },
+			.extent = { .width = width, .height = height },
+		},
+		.clearValueCount = 0,
+		.pClearValues = NULL,
+	}, VK_SUBPASS_CONTENTS_INLINE);
+	vkCmdDraw(buf, 3, 1, 0, 0);
+	vkCmdEndRenderPass(buf);
+	vkEndCommandBuffer(buf);
+
+	VkQueue queue;
+	vkGetDeviceQueue(device, qfamidx, 0, &queue);
+	res = vkQueueSubmit(queue, 1, &(VkSubmitInfo){
+		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+		.pNext = NULL,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = (VkSemaphore[]){ acquiresem },
+		.pWaitDstStageMask = (VkPipelineStageFlags[]){
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		},
+		.commandBufferCount = 1,
+		.pCommandBuffers = (VkCommandBuffer[]){
+			buf,
+		},
+		.signalSemaphoreCount = 1,
+		.pSignalSemaphores = (VkSemaphore[]){ display.semaphores[idx] },
+	}, fence);
+	if (res != VK_SUCCESS)
+		warnx("couldn't submit work to queue: %s", vkstrerror(res));
+
+	vkQueuePresentKHR(queue, &(VkPresentInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+		.pNext = NULL,
+		.waitSemaphoreCount = 1,
+		.pWaitSemaphores = (VkSemaphore[]){ display.semaphores[idx] },
+		.swapchainCount = 1,
+		.pSwapchains = (VkSwapchainKHR[]){ display.swapchain },
+		.pImageIndices = (uint32_t[]){ idx },
+		.pResults = NULL,
+	});
+
+	res = vkWaitForFences(
+		device, 1, (VkFence[]){ fence }, VK_TRUE, (uint64_t)-1);
+	if (res != VK_SUCCESS)
+        	warnx("couldn't wait on fence");
+	vkResetFences(device, 1, (VkFence[]){ fence });
+
+free_dset:
+	vkResetDescriptorPool(device, dpool, 0);
+free_buf:
+	vkFreeCommandBuffers(device, pool, 1, &buf);
+}
+
+int64_t
+nanotimerdiff(struct timespec a, struct timespec b)
+{
+	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
+}
+
+int
+main(void)
+{
+	setup();
+	struct timespec prev = {0};
+	while (!glfwWindowShouldClose(display.window)) {
+        	render();
+        	glfwWaitEvents();
+
+		struct timespec curr;
+        	clock_gettime(CLOCK_MONOTONIC, &curr);
+        	while (nanotimerdiff(curr, prev) < 1e9/60) {
+	        	nanosleep(&(struct timespec){ .tv_nsec = 5e5 }, NULL);
+	        	clock_gettime(CLOCK_MONOTONIC, &curr);
+        	}
+        	prev = curr;
+	}
+	teardown();
+
 	return 0;
 }
