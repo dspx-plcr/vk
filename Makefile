@@ -1,6 +1,6 @@
 .SUFFIXES: .glsl .spv
 
-CFLAGS = -std=gnu99 -pedantic -Wall -Wextra -g
+CFLAGS = -std=c99 -pedantic -Wall -Wextra -g
 LDFLAGS = -lvulkan -lm -lglfw
 TARGET = vk
 
@@ -13,6 +13,7 @@ SHADERS = \
 $(TARGET): $(OBJS) $(SHADERS)
 	cc -o $@ $(LDFLAGS) $(OBJS)
 
+main.c: linmath.h
 .c.o:
 	cc -c $(CFLAGS) $^
 

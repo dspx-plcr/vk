@@ -9,6 +9,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "linmath.h"
+
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
 //#define SIZE_T_MAX ((size_t)-1)
 #define SIZE_T_MAX SIZE_MAX
@@ -37,6 +39,7 @@ struct display {
 static const char *progname = "My Little Vulkan App";
 static const float width = 1920;
 static const float height = 1080;
+static const float depth = 1000;
 
 static VkInstance instance;
 static VkDevice device;
@@ -51,9 +54,41 @@ static VkShaderModule fragshader;
 static VkPipeline pipeline;
 static VkCommandPool pool;
 static VkDeviceMemory memory;
-static VkBuffer buffer;
+static VkBuffer vertbuf;
+static VkBuffer transbuf;
 static VkFence fence;
 static VkSemaphore acquiresem;
+static VkCommandBuffer cmdbuf;
+
+struct boundingbox {
+	vec3 offset;
+	vec3 extent;
+	vec3 dir; 
+};
+
+struct bounds {
+	struct boundingbox orig;
+	struct boundingbox curr;
+};
+
+struct object {
+	size_t nprims;
+	size_t meshidx;
+};
+
+struct vertexinfo {
+	vec3 pos;
+	vec3 norm;
+};
+
+static size_t nobjs;
+static struct object *objs;
+static struct vertexinfo *meshes;
+static size_t meshcnt;
+static size_t meshsz;
+static struct bounds *bounds;
+static vec3 camera;
+static mat4x4 *transforms;
 
 static const char *
 vkstrerror(VkResult res)
@@ -153,30 +188,39 @@ enum stage {
 	PIPELINE,
 	POOL,
 	DESCRIPTOR_POOL,
-	BUFFER,
+	VERTEX_BUFFER,
+	TRANSFORM_BUFFER,
 	DEVICE_MEMORY,
+	UNMAP_TRANSFORMS,
 	FENCE,
 	ACQUIRE_SEMAPHORE,
+	COMMAND_BUFFER,
 	ALL,
 };
 
 static void
-cleanup(enum stage s)
+cleanupgpu(enum stage s)
 {
-	VkQueue queue;
-	vkGetDeviceQueue(device, qfamidx, 0, &queue);
-	vkQueueWaitIdle(queue);
-	vkDeviceWaitIdle(device);
 	switch (s) {
+		VkQueue queue;
 	case ALL:
+		vkGetDeviceQueue(device, qfamidx, 0, &queue);
+		vkQueueWaitIdle(queue);
+		vkDeviceWaitIdle(device);
+	case COMMAND_BUFFER:
+		vkFreeCommandBuffers(device, pool, 1, &cmdbuf);
 	case ACQUIRE_SEMAPHORE:
 		vkDestroySemaphore(device, acquiresem, NULL /* allocator */);
 	case FENCE:
 		vkDestroyFence(device, fence, NULL /* allocator */);
+	case UNMAP_TRANSFORMS:
+		vkUnmapMemory(device, memory);
 	case DEVICE_MEMORY:
 		vkFreeMemory(device, memory, NULL /* allocator */);
-	case BUFFER:
-		vkDestroyBuffer(device, buffer, NULL /* allocator */);
+	case TRANSFORM_BUFFER:
+		vkDestroyBuffer(device, transbuf, NULL /* allocator */);
+	case VERTEX_BUFFER:
+		vkDestroyBuffer(device, vertbuf, NULL /* allocator */);
 	case DESCRIPTOR_POOL:
 		vkDestroyDescriptorPool(device, dpool, NULL /* allocator */);
 	case POOL:
@@ -184,7 +228,7 @@ cleanup(enum stage s)
 	case PIPELINE:
 		vkDestroyPipeline(device, pipeline, NULL /* allocator */);
 	case SHADERS:
-        case FRAG_SHADER:
+	case FRAG_SHADER:
 		vkDestroyShaderModule(device, fragshader, NULL /* allocator */);
 	case VERT_SHADER:
 		vkDestroyShaderModule(device, vertshader, NULL /* allocator */);
@@ -228,27 +272,27 @@ readshader(const char *filename, enum stage toclean)
 {
 	FILE *f = fopen(filename, "rb");
 	if (f == NULL) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		err(1, "couldn't open shader file for reading");
 	}
 	if (fseek(f, 0, SEEK_END) < 0) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		err(1, "couldn't seek to end of shader file");
 	}
 	size_t codesz = ftell(f);
 	if (fseek(f, 0, SEEK_SET) < 0) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		err(1, "couldn't seek to start of shader file");
 	}
 	uint32_t *code = malloc(codesz);
 	if (code == NULL) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		err(1, "couldn't allocate for shader code");
 	}
 	/* TODO: is endianness an issue here? */
 	size_t num = fread(code, 1, codesz, f);
 	if (num != codesz) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		if (ferror(f))
 			err(1, "couldn't read shader code into buffer");
 	}
@@ -264,7 +308,7 @@ readshader(const char *filename, enum stage toclean)
 		.pCode = code,
 	}, NULL /* allocator */, &shader);
 	if (res != VK_SUCCESS) {
-		cleanup(toclean);
+		cleanupgpu(toclean);
 		errx(1, "couldn't create shader module: %s", vkstrerror(res));
 	}
 
@@ -274,28 +318,104 @@ readshader(const char *filename, enum stage toclean)
 static void
 keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 {
-        (void)scancode;
-        (void)mods;
-        if ((key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
-            		&& action == GLFW_PRESS)
-                glfwSetWindowShouldClose(win, GLFW_TRUE);
+	(void)scancode;
+	(void)mods;
+	if ((key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
+	    		&& action == GLFW_PRESS)
+		glfwSetWindowShouldClose(win, GLFW_TRUE);
 }
 
 static void
-setup(void)
+expandbox(struct boundingbox *box, vec3 point, size_t axis)
+{
+	if (box->extent[axis] < 0) {
+		box->offset[axis] = point[axis];
+		box->extent[axis] = 0;
+	} else if (point[axis] < box->offset[axis]) {
+		box->extent[axis] += box->offset[axis] - point[axis];
+		box->offset[axis] = point[axis];
+	} else if (point[axis] > box->offset[axis] + box->extent[axis])
+		box->extent[axis] = point[axis] - box->offset[axis];
+}
+
+/* TODO: decouple objects from meshes */
+static void
+setupcpu(void)
+{
+	const char *files[] = {
+		"teapot.norm",
+	};
+
+	nobjs = ARR_SZ(files);
+	objs = malloc(sizeof(struct object) * nobjs);
+	if (objs == NULL) err(1, "couldn't allocate objects");
+	bounds = malloc(sizeof(struct bounds) * nobjs);
+	if (bounds == NULL) err(1, "couldn't allocate bounding boxes");
+
+	FILE *fs[ARR_SZ(files)];
+	for (size_t i = 0; i < ARR_SZ(fs); i++) {
+		fs[i] = fopen(files[i], "r");
+		if (fs[i] == NULL)
+			err(1, "couldn't open %s for reading", files[i]);
+		if (fscanf(fs[i], "%zu\n", &objs[i].nprims) == EOF)
+			err(1, "couldn't read nprims form %s", files[i]);
+		objs[i].meshidx = meshcnt;
+		meshcnt += 3*objs[i].nprims;
+		/* TODO: alignment is determined by the GPU */
+	}
+
+	meshes = malloc(sizeof(struct vertexinfo) * meshcnt);
+	if (meshes == NULL) err(1, "couldn't allocate meshes");
+	for (size_t i = 0; i < ARR_SZ(fs); i++) {
+		struct vertexinfo *vi = meshes + objs[i].meshidx;
+		struct boundingbox b = {
+			.offset = { 0, 0, 0 },
+			.extent = { -1, -1, -1 },
+			.dir = { 1.0, 0.0, 0.0 },
+		};
+		for (size_t j = 0; j < objs[i].nprims; j++) {
+			for (size_t k = 0; k < 3; k++) {
+				float *vert = (float *)(vi + 3*j + k);
+				int res = fscanf(fs[i], "%f %f %f\n%f %f %f\n",
+					vert, vert+1, vert+2,
+					vert+3, vert+4, vert+5);
+				if (res == EOF)
+					err(1, "couldn't read data from %s",
+						files[i]);
+				expandbox(&b, vert, 0);
+				expandbox(&b, vert, 1);
+				expandbox(&b, vert, 2);
+			}
+			if (fscanf(fs[i], "\n") == EOF)
+				err(1, "couldn't read data from %s", files[i]);
+		}
+		fclose(fs[i]);
+
+		bounds[i].orig = b;
+		vec4_scale(bounds[i].curr.offset, b.extent, -20);
+		vec4_scale(bounds[i].curr.extent, b.extent, 40);
+	}
+
+	camera[0] = 0;
+	camera[1] = height/10;
+	camera[2] = depth/4;
+}
+
+static void
+setupgpu(void)
 {
 	VkResult res;
 
 	if (!glfwInit()) {
-        	const char *msg;
-        	(void)glfwGetError(&msg);
-        	errx(1, "couldn't initialise GLFW context: %s", msg);
-        }
+		const char *msg;
+		(void)glfwGetError(&msg);
+		errx(1, "couldn't initialise GLFW context: %s", msg);
+	}
 
-        /* TODO: set the error callback and figure out how I want to use it */
+	/* TODO: set the error callback and figure out how I want to use it */
 
-        if (!glfwVulkanSupported())
-	        errx(1, "vulkan not supported by GLFW");
+	if (!glfwVulkanSupported())
+		errx(1, "vulkan not supported by GLFW");
 
 	uint32_t apiver;
 	res = vkEnumerateInstanceVersion(&apiver);
@@ -358,20 +478,23 @@ setup(void)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
+	glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
+	glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
 	display.window = glfwCreateWindow(
-        	width, height, progname, NULL, NULL);
+		width, height, progname, glfwGetPrimaryMonitor(), NULL);
 	if (display.window == NULL) {
-        	const char *msg;
-        	(void)glfwGetError(&msg);
-        	glfwTerminate();
-        	cleanup(INSTANCE);
-        	errx(1, "couldn't create a GLFW window: %s", msg);
+		const char *msg;
+		(void)glfwGetError(&msg);
+		glfwTerminate();
+		cleanupgpu(INSTANCE);
+		errx(1, "couldn't create a GLFW window: %s", msg);
 	}
 
 	res = glfwCreateWindowSurface(instance, display.window,
 		NULL /* allocator */, &display.surface);
 	if (res != VK_SUCCESS) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		errx(1, "couldn't create surface for window: %s",
 			vkstrerror(res));
 	}
@@ -380,34 +503,34 @@ setup(void)
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		errx(1, "coudln't get number of physical devices: %s",
 			vkstrerror(res));
 	}
 	VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * devcnt);
 	if (devs == NULL) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		err(1, "couldn't allocate to store physical devices");
 	}
 	size_t devcap = devcnt;
 	while ((res = vkEnumeratePhysicalDevices(instance, &devcnt, devs))
 			== VK_INCOMPLETE) {
 		if (SIZE_T_MAX / 2 / sizeof(VkPhysicalDevice) > devcap) {
-			cleanup(INSTANCE);
+			cleanupgpu(INSTANCE);
 			errx(1, "can't store %zu physical devices", devcap);
 		}
 		devcap *= 2;
 		VkPhysicalDevice *tmp = realloc(
 			devs, sizeof(VkPhysicalDevice) * devcap);
 		if (tmp == NULL) {
-			cleanup(INSTANCE);
+			cleanupgpu(INSTANCE);
 			err(1, "coudln't allocate to store physical devices");
 		}
 		devs = tmp;
 		devcnt = devcap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		errx(1, "couldn't get physical devices: %s", vkstrerror(res));
 	}
 
@@ -438,7 +561,7 @@ setup(void)
 	free(devs);
 
 	if (!found) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		errx(1, "couldn't find a compatible GPU");
 	}
 
@@ -464,7 +587,7 @@ setup(void)
 		.pEnabledFeatures = NULL,
 	}, NULL /* allocator */, &device);
 	if (res != VK_SUCCESS) {
-		cleanup(INSTANCE);
+		cleanupgpu(INSTANCE);
 		errx(1, "couldn't create logical device: %s", vkstrerror(res));
 	}
 
@@ -472,7 +595,7 @@ setup(void)
 	res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 		physdev, display.surface, &caps);
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't query for surface capabilities: %s",
 			vkstrerror(res));
 	}
@@ -486,7 +609,7 @@ setup(void)
 	res = vkGetPhysicalDeviceSurfaceFormats2KHR(
 		physdev, &surfinfo, &fmtcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't query for surface formats: %s",
 			vkstrerror(res));
 	}
@@ -494,7 +617,7 @@ setup(void)
 	/* TODO: can overflow */
 	VkSurfaceFormat2KHR *fmts = malloc(sizeof(VkSurfaceFormat2KHR)*fmtcap);
 	if (fmts == NULL) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		err(1, "couldn't allocate for surface formats");
 	}
 	for (size_t i = 0; i < fmtcnt; i++)
@@ -506,14 +629,14 @@ setup(void)
 			physdev, &surfinfo, &fmtcnt, fmts))
 	       		== VK_INCOMPLETE) {
 		if (SIZE_T_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
-			cleanup(DEVICE);
+			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", fmtcap);
 		}
 		fmtcap *= 2;
 		VkSurfaceFormat2KHR *tmp = realloc(
 			fmts, sizeof(VkSurfaceFormat2KHR) * fmtcap);
 		if (tmp == NULL) {
-			cleanup(DEVICE);
+			cleanupgpu(DEVICE);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		fmts = tmp;
@@ -525,7 +648,7 @@ setup(void)
 		fmtcnt = fmtcap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
 	}
 
@@ -533,7 +656,7 @@ setup(void)
 	res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 		physdev, display.surface, &modecnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't query for surface formats: %s",
 			vkstrerror(res));
 	}
@@ -541,28 +664,28 @@ setup(void)
 	/* TODO: can overflow */
 	VkPresentModeKHR *modes = malloc(sizeof(VkPresentModeKHR)*modecap);
 	if (modes == NULL) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		err(1, "couldn't allocate for surface formats");
 	}
 	while ((res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 			physdev, display.surface, &modecnt, modes))
 	       		== VK_INCOMPLETE) {
 		if (SIZE_T_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
-			cleanup(DEVICE);
+			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", modecap);
 		}
 		modecap *= 2;
 		VkPresentModeKHR *tmp = realloc(
 			modes, sizeof(VkPresentModeKHR) * modecap);
 		if (tmp == NULL) {
-			cleanup(DEVICE);
+			cleanupgpu(DEVICE);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		modes = tmp;
 		modecnt = modecap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
 	}
 
@@ -587,8 +710,7 @@ setup(void)
 		},
 		.imageArrayLayers = 1,
 		/* TODO: check caps */
-		.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-			VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = 1,
 		.pQueueFamilyIndices = (const uint32_t[]){ qfamidx },
@@ -600,34 +722,34 @@ setup(void)
 		.oldSwapchain = VK_NULL_HANDLE,
 	}, NULL /* allocator */, &display.swapchain);
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE);
+		cleanupgpu(DEVICE);
 		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
 	}
 
 	uint32_t imcnt;
 	res = vkGetSwapchainImagesKHR(device, display.swapchain, &imcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanup(SWAP_CHAIN);
+		cleanupgpu(SWAP_CHAIN);
 		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
 	}
 	size_t imcap = imcnt;
 	/* TODO: can overflow */
 	VkImage *ims = malloc(sizeof(VkImage) * imcap);
 	if (ims == NULL) {
-		cleanup(SWAP_CHAIN);
+		cleanupgpu(SWAP_CHAIN);
 		err(1, "couldn't allocate memory for images");
 	}
 	while ((res = vkGetSwapchainImagesKHR(
 			device, display.swapchain, &imcnt, ims))
 	       		== VK_INCOMPLETE) {
 		if (SIZE_T_MAX / 2 / sizeof(VkImage) > imcap) {
-			cleanup(SWAP_CHAIN);
+			cleanupgpu(SWAP_CHAIN);
 			errx(1, "can't store %zu physical devices", imcap);
 		}
 		imcap *= 2;
 		VkImage *tmp = realloc(modes, sizeof(VkImage) * imcap);
 		if (tmp == NULL) {
-			cleanup(SWAP_CHAIN);
+			cleanupgpu(SWAP_CHAIN);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		ims = tmp;
@@ -638,7 +760,7 @@ setup(void)
 
 	display.semaphores = malloc(sizeof(VkSemaphore) * imcnt);
 	if (display.semaphores == NULL) {
-		cleanup(SWAP_CHAIN);
+		cleanupgpu(SWAP_CHAIN);
 		err(1, "couldn't allocate for semaphores");
 	}
 	display.nsems = 0;
@@ -649,7 +771,7 @@ setup(void)
 			.flags = 0,
 		}, NULL /* allocator */, display.semaphores+i);
 		if (res != VK_SUCCESS) {
-			cleanup(SEMAPHORES);
+			cleanupgpu(SEMAPHORES);
 			errx(1, "couldn't create semaphore: %s", vkstrerror(res));
 		}
 		display.nsems++;
@@ -657,7 +779,7 @@ setup(void)
 
 	display.views = malloc(sizeof(VkImageView) * display.nims);
 	if (display.views == NULL) {
-		cleanup(SEMAPHORES);
+		cleanupgpu(SEMAPHORES);
 		err(1, "couldn't allocate for image views");
 	}
 	display.nviews = 0;
@@ -684,7 +806,7 @@ setup(void)
 			}
 		}, NULL /* allocator */, display.views+i);
 		if (res != VK_SUCCESS) {
-			cleanup(IMAGE_VIEWS);
+			cleanupgpu(IMAGE_VIEWS);
 			errx(1, "couldn't create image view: %s", vkstrerror(res));
 		}
 		display.nviews++;
@@ -728,13 +850,13 @@ setup(void)
 		.pDependencies = NULL,
 	}, NULL /* allocator */, &renderpass);
 	if (res != VK_SUCCESS) {
-		cleanup(IMAGE_VIEWS);
+		cleanupgpu(IMAGE_VIEWS);
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
 	}
 
 	display.framebuffers = malloc(sizeof(VkFramebuffer) * imcnt);
 	if (display.framebuffers == NULL) {
-		cleanup(IMAGE_VIEWS);
+		cleanupgpu(IMAGE_VIEWS);
 		err(1, "couldn't not allocate for framebuffers");
 	}
 	display.nfbs = 0;
@@ -753,7 +875,7 @@ setup(void)
 			.layers = 1,
 		}, NULL /* allocator */, display.framebuffers+i);
 		if (res != VK_SUCCESS) {
-			cleanup(FRAMEBUFFERS);
+			cleanupgpu(FRAMEBUFFERS);
 			errx(1, "coudln't allocate frame buffer: %s",
 				vkstrerror(res));
 		}
@@ -766,16 +888,16 @@ setup(void)
 		.flags = 0,
 		.bindingCount = 1,
 		.pBindings = (VkDescriptorSetLayoutBinding[]){ {
-				.binding = 1,
-				.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 				.descriptorCount = 1,
-				.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
 				.pImmutableSamplers = NULL,
 			},
 		},
 	}, NULL /* allocator */, &dsetlayout);
 	if (res != VK_SUCCESS) {
-		cleanup(FRAMEBUFFERS);
+		cleanupgpu(FRAMEBUFFERS);
 		errx(1, "couldn't allocate descriptor set layout: %s",
 			vkstrerror(res));
 	}
@@ -792,7 +914,7 @@ setup(void)
 		.pPushConstantRanges = NULL,
 	}, NULL /* allocator */, &layout);
 	if (res != VK_SUCCESS) {
-		cleanup(DESCRIPTOR_SET_LAYOUT);
+		cleanupgpu(DESCRIPTOR_SET_LAYOUT);
 		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
 	}
 
@@ -830,15 +952,21 @@ setup(void)
 			.vertexBindingDescriptionCount = 1,
 			.pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
 				.binding = 0,
-				.stride = 4*3,
+				.stride = sizeof(struct vertexinfo),
 				.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
 			},
-			.vertexAttributeDescriptionCount = 1,
-			.pVertexAttributeDescriptions = &(VkVertexInputAttributeDescription){
-				.location = 0,
-				.binding = 0,
-				.format = VK_FORMAT_R32G32B32_SFLOAT,
-				.offset = 0,
+			.vertexAttributeDescriptionCount = 2,
+			.pVertexAttributeDescriptions = (VkVertexInputAttributeDescription[]){{
+					.binding = 0,
+					.location = 0,
+					.format = VK_FORMAT_R32G32B32_SFLOAT,
+					.offset = offsetof(struct vertexinfo, pos),
+				}, {
+					.binding = 0,
+					.location = 1,
+					.format = VK_FORMAT_R32G32B32_SFLOAT,
+					.offset = offsetof(struct vertexinfo, norm),
+				},
 			},
 		},
 		.pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo){
@@ -870,7 +998,10 @@ setup(void)
 			.scissorCount = 1,
 			.pScissors = &(VkRect2D){
 				.offset = (VkOffset2D){ .x = 0, .y = 0 },
-				.extent = (VkExtent2D){ .width = 0, .height = 0},
+				.extent = (VkExtent2D){
+					.width = width,
+					.height = height
+				},
 			},
 		},
 		.pRasterizationState = &(VkPipelineRasterizationStateCreateInfo){
@@ -924,10 +1055,10 @@ setup(void)
 				.blendEnable = VK_FALSE,
 				.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
 				.dstColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
-				.colorBlendOp = VK_BLEND_OP_MAX,
+				.colorBlendOp = VK_BLEND_OP_ADD,
 				.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
 				.dstAlphaBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
-				.alphaBlendOp = VK_BLEND_OP_MAX,
+				.alphaBlendOp = VK_BLEND_OP_ADD,
 				.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
 					VK_COLOR_COMPONENT_G_BIT |
 					VK_COLOR_COMPONENT_B_BIT |
@@ -943,7 +1074,7 @@ setup(void)
 		.basePipelineIndex = 0,
 	}, NULL /* allocator */, &pipeline);
 	if (res != VK_SUCCESS) {
-		cleanup(SHADERS);
+		cleanupgpu(SHADERS);
 		errx(1, "couldn't create graphics pipeline: %s",
 			vkstrerror(res));
 	}
@@ -951,11 +1082,11 @@ setup(void)
 	res = vkCreateCommandPool(device, &(VkCommandPoolCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.pNext = NULL,
-		.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
 		.queueFamilyIndex = qfamidx,
 	}, NULL /* allocator */, &pool);
 	if (res != VK_SUCCESS) {
-		cleanup(PIPELINE);
+		cleanupgpu(PIPELINE);
 		errx(1, "couldn't allocate command pool: %s", vkstrerror(res));
 	}
 
@@ -964,15 +1095,18 @@ setup(void)
 		.pNext = NULL,
 		.flags = 0,
 		.maxSets = 1,
-		.poolSizeCount = 1,
+		.poolSizeCount = 2,
 		.pPoolSizes = (VkDescriptorPoolSize[]){ {
 				.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.descriptorCount = 1,
+			}, {
+				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 				.descriptorCount = 1,
 			},
 		},
 	}, NULL /* allocator */, &dpool);
 	if (res != VK_SUCCESS) {
-		cleanup(POOL);
+		cleanupgpu(POOL);
 		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
 	}
 
@@ -993,7 +1127,7 @@ setup(void)
 		}
 	}
 	if (memidx < 0) {
-		cleanup(DESCRIPTOR_POOL);
+		cleanupgpu(DESCRIPTOR_POOL);
 		errx(1, "couldn't find usable device memory");
 	}
 
@@ -1001,7 +1135,7 @@ setup(void)
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.size = sizeof(float)*3*3,
+		.size = sizeof(struct vertexinfo) * meshcnt,
 		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1009,29 +1143,80 @@ setup(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 		},
-	}, NULL /* allocator */, &buffer);
+	}, NULL /* allocator */, &vertbuf);
 	if (res != VK_SUCCESS) {
-		cleanup(DESCRIPTOR_POOL);
+		cleanupgpu(DESCRIPTOR_POOL);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = sizeof(mat4x4) * nobjs,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) {
+			qfamidx,
+		},
+	}, NULL /* allocator */, &transbuf);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(VERTEX_BUFFER);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
 	VkMemoryRequirements memreq;
-	vkGetBufferMemoryRequirements(device, buffer, &memreq);
+	vkGetBufferMemoryRequirements(device, vertbuf, &memreq);
+	size_t align = memreq.alignment - 1;
+	meshsz = (sizeof(struct vertexinfo)*meshcnt + align) & ~align;
+	size_t allocsz = max(memreq.size, meshsz + sizeof(mat4x4) * nobjs);
+	allocsz = (allocsz + align) & ~align;
 	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext = NULL,
-		.allocationSize = max(memreq.size, sizeof(float)*3*3),
+		.allocationSize = allocsz,
 		.memoryTypeIndex = (uint32_t)memidx,
 	}, NULL /* allocator */, &memory);
 	if (res != VK_SUCCESS) {
-		cleanup(BUFFER);
+		cleanupgpu(TRANSFORM_BUFFER);
 		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
 	}
 
-	res = vkBindBufferMemory(device, buffer, memory, 0);
+	res = vkBindBufferMemory2(device, 2, (VkBindBufferMemoryInfo[]){{
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = vertbuf,
+			.memory = memory,
+			.memoryOffset = 0,
+		}, {
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = transbuf,
+			.memory = memory,
+			.memoryOffset = meshsz,
+		},
+	});
 	if (res != VK_SUCCESS) {
-		cleanup(DEVICE_MEMORY);
+		cleanupgpu(DEVICE_MEMORY);
 		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
+	}
+
+	void *ptr;
+	res = vkMapMemory(device, memory, 0, meshsz, 0, &ptr); 
+	if (res != VK_SUCCESS) {
+		cleanupgpu(DEVICE_MEMORY);
+		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
+	}
+	memcpy(ptr, meshes, sizeof(struct vertexinfo)*meshcnt);
+	vkUnmapMemory(device, memory);
+
+	res = vkMapMemory(device, memory, meshsz, allocsz-meshsz, 0,
+		(void **)&transforms);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(DEVICE_MEMORY);
+		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
 
 	res = vkCreateFence(device, &(VkFenceCreateInfo){
@@ -1040,7 +1225,7 @@ setup(void)
 		.flags = 0,
 	}, NULL /* allocator */, &fence);
 	if (res != VK_SUCCESS) {
-		cleanup(BUFFER);
+		cleanupgpu(UNMAP_TRANSFORMS);
 		errx(1, "couldn't create fence: %s", vkstrerror(res));
 	}
 
@@ -1050,15 +1235,27 @@ setup(void)
 		.flags = 0,
 	}, NULL /* allocator */, &acquiresem);
 	if (res != VK_SUCCESS) {
-		cleanup(FENCE);
+		cleanupgpu(FENCE);
 		errx(1, "couldn't create semaphore: %s", vkstrerror(res));
+	}
+
+	res = vkAllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+		.pNext = NULL,
+		.commandPool = pool,
+		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+		.commandBufferCount = 1,
+	}, &cmdbuf);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(ACQUIRE_SEMAPHORE);
+		errx(1, "couldn't get a command buffer: %s", vkstrerror(res));
 	}
 }
 
 static void
 teardown(void)
 {
-	cleanup(ALL);
+	cleanupgpu(ALL);
 	glfwDestroyWindow(display.window);
 	glfwTerminate();
 }
@@ -1083,19 +1280,6 @@ render(void)
 		return;
 	}
 
-	VkCommandBuffer buf;
-	res = vkAllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
-		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-		.pNext = NULL,
-		.commandPool = pool,
-		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-		.commandBufferCount = 1,
-	}, &buf);
-	if (res != VK_SUCCESS) {
-		warnx("couldn't get a command buffer: %s", vkstrerror(res));
-		return;
-	}
-
 	VkDescriptorSet dset;
 	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1108,10 +1292,16 @@ render(void)
 	}, &dset);
 	if (res != VK_SUCCESS) {
 		warnx("couldn't get a descriptor set: %s", vkstrerror(res));
-		goto free_buf;
+		return;
 	}
 
-	res = vkBeginCommandBuffer(buf, &(VkCommandBufferBeginInfo){
+	res = vkResetCommandBuffer(cmdbuf, 0);
+	if (res != VK_SUCCESS) {
+		warnx("couldn't reset command buffer: %s", vkstrerror(res));
+		return;
+	}
+
+	res = vkBeginCommandBuffer(cmdbuf, &(VkCommandBufferBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.pNext = NULL,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -1122,15 +1312,55 @@ render(void)
 		goto free_dset;
 	}
 
-	vkCmdBindDescriptorSets(buf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
-		0, 1, &dset, 0, NULL);
-	vkCmdBindPipeline(buf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-	vkCmdBindVertexBuffers(buf, 0, 1, (VkBuffer[]){
-		buffer,
-	}, (VkDeviceSize[]){
-		0,
-	});
-	vkCmdBeginRenderPass(buf, &(VkRenderPassBeginInfo){
+	for (size_t i = 0; i < nobjs; i++) {
+		mat4x4 A, model, view, proj;
+
+		const float *off = bounds[i].orig.offset;
+		const float *box = bounds[i].curr.extent;
+		const float *ogbox = bounds[i].orig.extent;
+		mat4x4_identity(A);
+		mat4x4_scale_aniso(model, A,
+			(box[0] / width) / ogbox[0],
+			(box[1] / height) / ogbox[1],
+			(box[2] / depth) / ogbox[2]);
+		mat4x4_translate(A,
+			2*off[0] / width,
+			2*off[1] / height,
+			2*off[2] / depth);
+		mat4x4_mul(model, A, model);
+		mat4x4_look_at(view,
+			(vec3){ 0, 0, -1 },
+			(vec3){ 0, 0, 0 },
+			(vec3){ 0, -1, 0 });
+		mat4x4_perspective(proj, 120, width/height, -1.0, 1.0);
+		mat4x4_mul(A, view, model);
+		mat4x4_mul(transforms[i], proj, A);
+	}
+	vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.pNext = NULL,
+			.dstSet = dset,
+			.dstBinding = 0,
+			.dstArrayElement = 0,
+			.descriptorCount = 1,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+			.pImageInfo = NULL,
+			.pBufferInfo = (VkDescriptorBufferInfo[]){{
+					.buffer = transbuf,
+					.offset = 0,
+					.range = VK_WHOLE_SIZE,
+				},
+			},
+			.pTexelBufferView = NULL,
+		},
+	}, 0, NULL);
+	vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+		0, 1, &dset, 1, (uint32_t[]){ 0 });
+	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+	vkCmdBindVertexBuffers(cmdbuf, 0, 1,
+		(VkBuffer[]){ vertbuf },
+		(VkDeviceSize[]){ 0 });
+	vkCmdBeginRenderPass(cmdbuf, &(VkRenderPassBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.pNext = NULL,
 		.renderPass = renderpass,
@@ -1142,9 +1372,9 @@ render(void)
 		.clearValueCount = 0,
 		.pClearValues = NULL,
 	}, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdDraw(buf, 3, 1, 0, 0);
-	vkCmdEndRenderPass(buf);
-	vkEndCommandBuffer(buf);
+	vkCmdDraw(cmdbuf, meshcnt, 1, 0, 0);
+	vkCmdEndRenderPass(cmdbuf);
+	vkEndCommandBuffer(cmdbuf);
 
 	VkQueue queue;
 	vkGetDeviceQueue(device, qfamidx, 0, &queue);
@@ -1158,7 +1388,7 @@ render(void)
 		},
 		.commandBufferCount = 1,
 		.pCommandBuffers = (VkCommandBuffer[]){
-			buf,
+			cmdbuf,
 		},
 		.signalSemaphoreCount = 1,
 		.pSignalSemaphores = (VkSemaphore[]){ display.semaphores[idx] },
@@ -1180,16 +1410,14 @@ render(void)
 	res = vkWaitForFences(
 		device, 1, (VkFence[]){ fence }, VK_TRUE, (uint64_t)-1);
 	if (res != VK_SUCCESS)
-        	warnx("couldn't wait on fence");
+		warnx("couldn't wait on fence");
 	vkResetFences(device, 1, (VkFence[]){ fence });
 
 free_dset:
 	vkResetDescriptorPool(device, dpool, 0);
-free_buf:
-	vkFreeCommandBuffers(device, pool, 1, &buf);
 }
 
-int64_t
+static int64_t
 nanotimerdiff(struct timespec a, struct timespec b)
 {
 	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
@@ -1198,19 +1426,20 @@ nanotimerdiff(struct timespec a, struct timespec b)
 int
 main(void)
 {
-	setup();
+	setupcpu();
+	setupgpu();
 	struct timespec prev = {0};
 	while (!glfwWindowShouldClose(display.window)) {
-        	render();
-        	glfwWaitEvents();
+		render();
+		glfwWaitEvents();
 
 		struct timespec curr;
-        	clock_gettime(CLOCK_MONOTONIC, &curr);
-        	while (nanotimerdiff(curr, prev) < 1e9/60) {
-	        	nanosleep(&(struct timespec){ .tv_nsec = 5e5 }, NULL);
-	        	clock_gettime(CLOCK_MONOTONIC, &curr);
-        	}
-        	prev = curr;
+		clock_gettime(CLOCK_MONOTONIC, &curr);
+		while (nanotimerdiff(curr, prev) < 1e9/60) {
+			nanosleep(&(struct timespec){ .tv_nsec = 5e5 }, NULL);
+			clock_gettime(CLOCK_MONOTONIC, &curr);
+		}
+		prev = curr;
 	}
 	teardown();
 
