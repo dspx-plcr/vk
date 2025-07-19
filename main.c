@@ -12,8 +12,6 @@
 #include "linmath.h"
 
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
-//#define SIZE_T_MAX ((size_t)-1)
-#define SIZE_T_MAX SIZE_MAX
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
@@ -515,7 +513,7 @@ setupgpu(void)
 	size_t devcap = devcnt;
 	while ((res = vkEnumeratePhysicalDevices(instance, &devcnt, devs))
 			== VK_INCOMPLETE) {
-		if (SIZE_T_MAX / 2 / sizeof(VkPhysicalDevice) > devcap) {
+		if (SIZE_MAX / 2 / sizeof(VkPhysicalDevice) > devcap) {
 			cleanupgpu(INSTANCE);
 			errx(1, "can't store %zu physical devices", devcap);
 		}
@@ -628,7 +626,7 @@ setupgpu(void)
 	while ((res = vkGetPhysicalDeviceSurfaceFormats2KHR(
 			physdev, &surfinfo, &fmtcnt, fmts))
 	       		== VK_INCOMPLETE) {
-		if (SIZE_T_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
+		if (SIZE_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
 			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", fmtcap);
 		}
@@ -670,7 +668,7 @@ setupgpu(void)
 	while ((res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 			physdev, display.surface, &modecnt, modes))
 	       		== VK_INCOMPLETE) {
-		if (SIZE_T_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
+		if (SIZE_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
 			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", modecap);
 		}
@@ -742,7 +740,7 @@ setupgpu(void)
 	while ((res = vkGetSwapchainImagesKHR(
 			device, display.swapchain, &imcnt, ims))
 	       		== VK_INCOMPLETE) {
-		if (SIZE_T_MAX / 2 / sizeof(VkImage) > imcap) {
+		if (SIZE_MAX / 2 / sizeof(VkImage) > imcap) {
 			cleanupgpu(SWAP_CHAIN);
 			errx(1, "can't store %zu physical devices", imcap);
 		}
