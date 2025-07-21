@@ -38,6 +38,7 @@ static const char *progname = "My Little Vulkan App";
 static const float width = 1920;
 static const float height = 1080;
 static const float depth = 1000;
+static const float meshpct = 0.9;
 
 static VkInstance instance;
 static VkDevice device;
@@ -54,6 +55,7 @@ static VkCommandPool pool;
 static VkDeviceMemory memory;
 static VkBuffer vertbuf;
 static VkBuffer transbuf;
+static VkBuffer modelbuf;
 static VkFence fence;
 static VkSemaphore acquiresem;
 static VkCommandBuffer cmdbuf;
@@ -87,6 +89,7 @@ static size_t meshsz;
 static struct bounds *bounds;
 static vec3 camera;
 static mat4x4 *transforms;
+static mat4x4 *models;
 
 static const char *
 vkstrerror(VkResult res)
@@ -188,6 +191,7 @@ enum stage {
 	DESCRIPTOR_POOL,
 	VERTEX_BUFFER,
 	TRANSFORM_BUFFER,
+	MODEL_BUFFER,
 	DEVICE_MEMORY,
 	UNMAP_TRANSFORMS,
 	FENCE,
@@ -215,6 +219,8 @@ cleanupgpu(enum stage s)
 		vkUnmapMemory(device, memory);
 	case DEVICE_MEMORY:
 		vkFreeMemory(device, memory, NULL /* allocator */);
+	case MODEL_BUFFER:
+		vkDestroyBuffer(device, modelbuf, NULL /* allocator */);
 	case TRANSFORM_BUFFER:
 		vkDestroyBuffer(device, transbuf, NULL /* allocator */);
 	case VERTEX_BUFFER:
@@ -708,7 +714,8 @@ setupgpu(void)
 		},
 		.imageArrayLayers = 1,
 		/* TODO: check caps */
-		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT,
 		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = 1,
 		.pQueueFamilyIndices = (const uint32_t[]){ qfamidx },
@@ -819,7 +826,7 @@ setupgpu(void)
 				.flags = 0,
 				.format = display.fmt.format,
 				.samples = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
 				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
 				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -884,9 +891,15 @@ setupgpu(void)
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.bindingCount = 1,
+		.bindingCount = 2,
 		.pBindings = (VkDescriptorSetLayoutBinding[]){ {
 				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+				.pImmutableSamplers = NULL,
+			}, {
+				.binding = 1,
 				.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 				.descriptorCount = 1,
 				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
@@ -986,18 +999,21 @@ setupgpu(void)
 			.flags = 0,
 			.viewportCount = 1,
 			.pViewports = &(VkViewport){
-				.x = 0,
+				.x = (1-meshpct)*width,
 				.y = 0,
-				.width = width,
+				.width = meshpct * width,
 				.height = height,
 				.minDepth = 0.0,
 				.maxDepth = 1.0,
 			},
 			.scissorCount = 1,
 			.pScissors = &(VkRect2D){
-				.offset = (VkOffset2D){ .x = 0, .y = 0 },
+				.offset = (VkOffset2D){
+					.x = (1-meshpct)*width,
+					.y = 0
+				},
 				.extent = (VkExtent2D){
-					.width = width,
+					.width = meshpct * width,
 					.height = height
 				},
 			},
@@ -1099,7 +1115,7 @@ setupgpu(void)
 				.descriptorCount = 1,
 			}, {
 				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-				.descriptorCount = 1,
+				.descriptorCount = 2,
 			},
 		},
 	}, NULL /* allocator */, &dpool);
@@ -1129,6 +1145,7 @@ setupgpu(void)
 		errx(1, "couldn't find usable device memory");
 	}
 
+	/* TODO: put these bad bois in variables (size) */
 	res = vkCreateBuffer(device, &(VkBufferCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
@@ -1165,12 +1182,32 @@ setupgpu(void)
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = sizeof(mat4x4) * nobjs,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) {
+			qfamidx,
+		},
+	}, NULL /* allocator */, &modelbuf);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(TRANSFORM_BUFFER);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	/* TODO: all of this can overflow */
 	VkMemoryRequirements memreq;
 	vkGetBufferMemoryRequirements(device, vertbuf, &memreq);
 	size_t align = memreq.alignment - 1;
 	meshsz = (sizeof(struct vertexinfo)*meshcnt + align) & ~align;
-	size_t allocsz = max(memreq.size, meshsz + sizeof(mat4x4) * nobjs);
-	allocsz = (allocsz + align) & ~align;
+	size_t transsz = (sizeof(mat4x4) * nobjs + align) & ~align;
+	size_t modelsz = (sizeof(mat4x4) * nobjs + align) & ~align;
+	size_t allocsz = max(memreq.size, meshsz + transsz + modelsz);
 	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext = NULL,
@@ -1178,11 +1215,11 @@ setupgpu(void)
 		.memoryTypeIndex = (uint32_t)memidx,
 	}, NULL /* allocator */, &memory);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(TRANSFORM_BUFFER);
+		cleanupgpu(MODEL_BUFFER);
 		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
 	}
 
-	res = vkBindBufferMemory2(device, 2, (VkBindBufferMemoryInfo[]){{
+	res = vkBindBufferMemory2(device, 3, (VkBindBufferMemoryInfo[]){{
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
 			.buffer = vertbuf,
@@ -1194,6 +1231,12 @@ setupgpu(void)
 			.buffer = transbuf,
 			.memory = memory,
 			.memoryOffset = meshsz,
+		}, {
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = modelbuf,
+			.memory = memory,
+			.memoryOffset = meshsz + transsz,
 		},
 	});
 	if (res != VK_SUCCESS) {
@@ -1201,6 +1244,7 @@ setupgpu(void)
 		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
 	}
 
+	/* TODO: investigate the consequences of this being one big mem block */
 	void *ptr;
 	res = vkMapMemory(device, memory, 0, meshsz, 0, &ptr); 
 	if (res != VK_SUCCESS) {
@@ -1210,12 +1254,13 @@ setupgpu(void)
 	memcpy(ptr, meshes, sizeof(struct vertexinfo)*meshcnt);
 	vkUnmapMemory(device, memory);
 
-	res = vkMapMemory(device, memory, meshsz, allocsz-meshsz, 0,
+	res = vkMapMemory(device, memory, meshsz, transsz+modelsz, 0,
 		(void **)&transforms);
 	if (res != VK_SUCCESS) {
 		cleanupgpu(DEVICE_MEMORY);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
+	models = (mat4x4 *)((char *)transforms + transsz);
 
 	res = vkCreateFence(device, &(VkFenceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
@@ -1333,6 +1378,7 @@ render(void)
 		mat4x4_perspective(proj, 120, width/height, -1.0, 1.0);
 		mat4x4_mul(A, view, model);
 		mat4x4_mul(transforms[i], proj, A);
+		mat4x4_dup(models[i], model);
 	}
 	vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
@@ -1340,11 +1386,15 @@ render(void)
 			.dstSet = dset,
 			.dstBinding = 0,
 			.dstArrayElement = 0,
-			.descriptorCount = 1,
+			.descriptorCount = 2,
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 			.pImageInfo = NULL,
 			.pBufferInfo = (VkDescriptorBufferInfo[]){{
 					.buffer = transbuf,
+					.offset = 0,
+					.range = VK_WHOLE_SIZE,
+				}, {
+					.buffer = modelbuf,
 					.offset = 0,
 					.range = VK_WHOLE_SIZE,
 				},
@@ -1353,7 +1403,7 @@ render(void)
 		},
 	}, 0, NULL);
 	vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
-		0, 1, &dset, 1, (uint32_t[]){ 0 });
+		0, 1, &dset, 2, (uint32_t[]){ 0, 0 });
 	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 	vkCmdBindVertexBuffers(cmdbuf, 0, 1,
 		(VkBuffer[]){ vertbuf },
@@ -1364,11 +1414,14 @@ render(void)
 		.renderPass = renderpass,
 		.framebuffer = display.framebuffers[idx],
 		.renderArea = {
-			.offset = { .x = 0, .y = 0 },
-			.extent = { .width = width, .height = height },
+			.offset = { .x = (1-meshpct)*width, .y = 0 },
+			.extent = { .width = meshpct*width, .height = height },
 		},
-		.clearValueCount = 0,
-		.pClearValues = NULL,
+		.clearValueCount = 1,
+		.pClearValues = (VkClearValue[]) { {
+				.color = { .float32 = { 0.6, 0.6, 0.6, 1.0 } },
+			}
+		  },
 	}, VK_SUBPASS_CONTENTS_INLINE);
 	vkCmdDraw(cmdbuf, meshcnt, 1, 0, 0);
 	vkCmdEndRenderPass(cmdbuf);
