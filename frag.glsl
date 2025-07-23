@@ -17,7 +17,7 @@ ambient(in vec3 col, out vec3 res)
 void
 diffuse(in vec3 col, in vec3 norm, in vec3 frag, out vec3 res)
 {
-	vec3 lightpos = vec3(0.3, 0.7, 1.0);
+	vec3 lightpos = vec3(0.3*1920/2, 0.7*1080/2, 1.0*1000/2);
 	vec3 lightdir = normalize(lightpos - frag);
 	float diff = max(dot(norm, lightdir), 0.0);
 	vec3 lightColor = vec3(1, 1, 1);
@@ -27,7 +27,7 @@ diffuse(in vec3 col, in vec3 norm, in vec3 frag, out vec3 res)
 void
 diffuse2(in vec3 col, in vec3 norm, in vec3 frag, out vec3 res)
 {
-	vec3 lightpos = vec3(-0.3, -0.3, 0.3);
+	vec3 lightpos = vec3(-0.3*1920/2, -0.3*1080/2, 0.3*1000/2);
 	vec3 lightdir = normalize(lightpos - frag);
 	float diff = max(dot(norm, lightdir), 0.0);
 	vec3 lightColor = vec3(1, 1, 1);

@@ -1,5 +1,7 @@
 #include <err.h>
 #include <inttypes.h>
+#include <math.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -14,6 +16,7 @@
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
 #define min(a, b) ((a) < (b) ? (a) : (b))
 #define max(a, b) ((a) > (b) ? (a) : (b))
+#define PI ((double)3.14159265358979323846)
 
 struct display {
 	GLFWwindow *window;
@@ -40,11 +43,18 @@ static const float height = 1080;
 static const float depth = 1000;
 static const float meshpct = 0.9;
 
+static const double panspeed = 0.2;
+static const double rotspeed = PI / (2 * width);
+static const double zoomspeed = 70;
+
 static VkInstance instance;
 static VkDevice device;
 static uint32_t qfamidx;
 static struct display display;
 static VkRenderPass renderpass;
+static VkImage depthbuf;
+static VkImageView depthview;
+static VkDeviceMemory depthmem;
 static VkDescriptorSetLayout dsetlayout;
 static VkDescriptorPool dpool;
 static VkPipelineLayout layout;
@@ -88,8 +98,19 @@ static size_t meshcnt;
 static size_t meshsz;
 static struct bounds *bounds;
 static vec3 camera;
+static vec3 target;
 static mat4x4 *transforms;
 static mat4x4 *models;
+
+static vec2 lastmouse;
+static bool panning;
+static bool rotating;
+
+static int64_t
+nanotimerdiff(struct timespec a, struct timespec b)
+{
+	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
+}
 
 static const char *
 vkstrerror(VkResult res)
@@ -180,6 +201,9 @@ enum stage {
 	SEMAPHORES,
 	IMAGE_VIEWS,
 	RENDER_PASS,
+	DEPTH_BUFFER,
+	DEPTH_MEMORY,
+	DEPTH_VIEW,
 	FRAMEBUFFERS,
 	DESCRIPTOR_SET_LAYOUT,
 	LAYOUT,
@@ -246,6 +270,12 @@ cleanupgpu(enum stage s)
 			vkDestroyFramebuffer(device, display.framebuffers[i],
 				NULL /* allocator */);
 		display.nfbs = 0;
+	case DEPTH_VIEW:
+		vkDestroyImageView(device, depthview, NULL /* allocator */);
+	case DEPTH_MEMORY:
+		vkFreeMemory(device, depthmem, NULL /* allocator */);
+	case DEPTH_BUFFER:
+		vkDestroyImage(device, depthbuf, NULL /* allocator */);
 	case RENDER_PASS:
 		vkDestroyRenderPass(device, renderpass, NULL /* allocator */);
 	case IMAGE_VIEWS:
@@ -330,6 +360,118 @@ keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 }
 
 static void
+mousecb(GLFWwindow *win, int button, int action, int mods)
+{
+	switch (button) {
+	case GLFW_MOUSE_BUTTON_LEFT:
+		if (action == GLFW_RELEASE) {
+			panning = false;
+			rotating = false;
+		}
+
+		if ((action == GLFW_PRESS) && (mods & GLFW_MOD_SHIFT)) {
+			double x, y;
+			glfwGetCursorPos(win, &x, &y);
+			lastmouse[0] = x;
+			lastmouse[1] = y;
+			panning = true;
+		}
+		if ((action == GLFW_PRESS) && (mods & GLFW_MOD_CONTROL)) {
+			double x, y;
+			glfwGetCursorPos(win, &x, &y);
+			lastmouse[0] = x;
+			lastmouse[1] = y;
+			rotating = true;
+		}
+		break;
+	}
+}
+
+static void
+cart2sph(vec3 sph, vec3 cart)
+{
+	double x = cart[0];
+	double y = cart[1];
+	double z = cart[2];
+
+	double r = sqrt(x*x + y*y + z*z);
+	double t = atan2(x, z);
+	double p = asin(z / r);
+	if (y < 0) p = -p;
+
+	sph[0] = r;
+	sph[1] = t;
+	sph[2] = p;
+}
+
+static void
+sph2cart(vec3 cart, vec3 sph)
+{
+	double r = sph[0];
+	double t = sph[1];
+	double p = sph[2];
+
+	cart[0] = r * cos(p) * sin(t);
+	cart[1] = r * sin(p);
+	cart[2] = r * cos(p) * cos (t);
+}
+
+static void
+scrollcb(GLFWwindow *win, double x, double y)
+{
+	(void)win;
+	(void)x;
+	vec3 shifted, shiftedP;
+	vec3_sub(shifted, camera, target);
+	cart2sph(shiftedP, shifted);
+	shiftedP[0] += y < 0 ? zoomspeed : -zoomspeed;
+	sph2cart(shifted, shiftedP);
+	vec3_add(camera, target, shifted);
+}
+
+static void
+cursorcb(GLFWwindow *win, double x, double y)
+{
+	(void)win;
+	if (panning) {
+		/* TODO: What we're doing here is nonsense */
+		vec2 dpos;
+		vec2_sub(dpos, lastmouse, (vec2){ x, y });
+		lastmouse[0] = x;
+		lastmouse[1] = y;
+
+		vec2_add(target, target, (vec2){
+			dpos[0] * panspeed,
+			dpos[1] * panspeed,
+		});
+	}
+
+	if (rotating) {
+		vec2 dpos;
+		vec2_sub(dpos, lastmouse, (vec2){ x, y });
+		lastmouse[0] = x;
+		lastmouse[1] = y;
+
+		/* TODO: Fix the discontinuities */
+		vec3 shifted, shiftedP;
+		vec3_sub(shifted, camera, target);
+		cart2sph(shiftedP, shifted);
+		shiftedP[1] += rotspeed * dpos[0];
+		shiftedP[2] += rotspeed * dpos[1];
+		if (shiftedP[1] < 0)
+			shiftedP[1] += 2*PI;
+		else if (shiftedP[1] > 2*PI)
+			shiftedP[1] -= 2*PI;
+		if (shiftedP[2] < -PI/2)
+			shiftedP[2] += PI;
+		else if (shiftedP[2] > PI/2)
+			shiftedP[2] -= PI;
+		sph2cart(shifted, shiftedP);
+		vec3_add(camera, target, shifted);
+	}
+}
+
+static void
 expandbox(struct boundingbox *box, vec3 point, size_t axis)
 {
 	if (box->extent[axis] < 0) {
@@ -400,9 +542,12 @@ setupcpu(void)
 		vec4_scale(bounds[i].curr.extent, b.extent, 40);
 	}
 
+	target[0] = 0;
+	target[1] = 0;
+	target[2] = 0;
 	camera[0] = 0;
-	camera[1] = height/10;
-	camera[2] = depth/4;
+	camera[1] = height/4;
+	camera[2] = depth/2;
 }
 
 static void
@@ -503,6 +648,9 @@ setupgpu(void)
 			vkstrerror(res));
 	}
 	glfwSetKeyCallback(display.window, &keycb);
+	glfwSetMouseButtonCallback(display.window, &mousecb);
+	glfwSetScrollCallback(display.window, &scrollcb);
+	glfwSetCursorPosCallback(display.window, &cursorcb);
 
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
@@ -631,7 +779,7 @@ setupgpu(void)
 		};
 	while ((res = vkGetPhysicalDeviceSurfaceFormats2KHR(
 			physdev, &surfinfo, &fmtcnt, fmts))
-	       		== VK_INCOMPLETE) {
+			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
 			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", fmtcap);
@@ -673,7 +821,7 @@ setupgpu(void)
 	}
 	while ((res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 			physdev, display.surface, &modecnt, modes))
-	       		== VK_INCOMPLETE) {
+			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
 			cleanupgpu(DEVICE);
 			errx(1, "can't store %zu physical devices", modecap);
@@ -746,7 +894,7 @@ setupgpu(void)
 	}
 	while ((res = vkGetSwapchainImagesKHR(
 			device, display.swapchain, &imcnt, ims))
-	       		== VK_INCOMPLETE) {
+			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkImage) > imcap) {
 			cleanupgpu(SWAP_CHAIN);
 			errx(1, "can't store %zu physical devices", imcap);
@@ -821,7 +969,7 @@ setupgpu(void)
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.attachmentCount = 1,
+		.attachmentCount = 2,
 		.pAttachments = (const VkAttachmentDescription[]){ {
 				.flags = 0,
 				.format = display.fmt.format,
@@ -832,8 +980,18 @@ setupgpu(void)
 				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
 				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
 				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			}, {
+				.flags = 0,
+				.format = VK_FORMAT_D32_SFLOAT,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 			},
-		},
+		  },
 		.subpassCount = 1,
 		.pSubpasses = &(VkSubpassDescription){
 			.flags = 0,
@@ -847,21 +1005,139 @@ setupgpu(void)
 				},
 			 },
 			.pResolveAttachments = NULL,
-			.pDepthStencilAttachment = NULL,
+			.pDepthStencilAttachment = (VkAttachmentReference[]){ {
+					.attachment = 1,
+					.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				},
+			},
 			.preserveAttachmentCount = 0,
 			.pPreserveAttachments = NULL,
 		},
-		.dependencyCount = 0,
-		.pDependencies = NULL,
+		/* TODO: what's going on here */
+		.dependencyCount = 1,
+		.pDependencies = (VkSubpassDependency[]){{
+				.srcSubpass = VK_SUBPASS_EXTERNAL,
+				.dstSubpass = 0,
+				.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			},
+		},
 	}, NULL /* allocator */, &renderpass);
 	if (res != VK_SUCCESS) {
 		cleanupgpu(IMAGE_VIEWS);
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
 	}
 
+	res = vkCreateImage(device, &(VkImageCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = VK_FORMAT_D32_SFLOAT,
+		.extent = {
+			.width = width,
+			.height = height,
+			.depth = 1,
+		},
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]){ qfamidx },
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	}, NULL /* allocator */, &depthbuf);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(IMAGE_VIEWS);
+		errx(1, "could't not create image for depth buffer: %s",
+			vkstrerror(res));
+	}
+
+	/* TODO: Do this during usabledev */
+	VkPhysicalDeviceMemoryProperties2 memprops = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+		.pNext = NULL,
+	};
+	vkGetPhysicalDeviceMemoryProperties2(physdev, &memprops);
+	int64_t memidx = -1;
+	for (size_t i = 0; i < memprops.memoryProperties.memoryTypeCount; i++) {
+		VkMemoryPropertyFlags flags =
+			memprops.memoryProperties.memoryTypes[i].propertyFlags;
+		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+				(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+			memidx = i;
+			break;
+		}
+	}
+	if (memidx < 0) {
+		cleanupgpu(DEPTH_BUFFER);
+		errx(1, "couldn't find usable device memory");
+	}
+
+	VkMemoryRequirements2 imreqs = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+		.pNext = NULL,
+	};
+	vkGetImageMemoryRequirements2(device, &(VkImageMemoryRequirementsInfo2){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+		.pNext = NULL,
+		.image = depthbuf,
+	}, &imreqs);
+	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = NULL,
+		/* TODO: align */
+		.allocationSize = imreqs.memoryRequirements.size,
+		.memoryTypeIndex = (uint32_t)memidx,
+	}, NULL /* allocator */, &depthmem);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(DEPTH_BUFFER);
+		errx(1, "couldn't allocate memory for depth buffer: %s",
+			vkstrerror(res));
+	}
+
+	res = vkBindImageMemory2(device, 1, (VkBindImageMemoryInfo[]){{
+			.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+			.pNext = NULL,
+			.image = depthbuf,
+			.memory = depthmem,
+			.memoryOffset = 0,
+		},
+	});
+	if (res != VK_SUCCESS) {
+		cleanupgpu(DEPTH_MEMORY);
+		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
+	}
+
+	res = vkCreateImageView(device, &(VkImageViewCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.image = depthbuf,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = VK_FORMAT_D32_SFLOAT,
+		.components = { 0, },
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		}
+	}, NULL /* allocator */, &depthview);
+	if (res != VK_SUCCESS) {
+		cleanupgpu(DEPTH_MEMORY);
+		errx(1, "couldn't create image view for depth buffer: %s",
+			vkstrerror(res));
+	}
+
 	display.framebuffers = malloc(sizeof(VkFramebuffer) * imcnt);
 	if (display.framebuffers == NULL) {
-		cleanupgpu(IMAGE_VIEWS);
+		cleanupgpu(DEPTH_VIEW);
 		err(1, "couldn't not allocate for framebuffers");
 	}
 	display.nfbs = 0;
@@ -871,9 +1147,10 @@ setupgpu(void)
 			.pNext = NULL,
 			.flags = 0,
 			.renderPass = renderpass,
-			.attachmentCount = 1,
+			.attachmentCount = 2,
 			.pAttachments = (VkImageView[]) {
 				display.views[i],
+				depthview,
 			},
 			.width = width,
 			.height = height,
@@ -1048,15 +1325,15 @@ setupgpu(void)
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
 			.pNext = NULL,
 			.flags = 0,
-			.depthTestEnable = VK_FALSE,
-			.depthWriteEnable = VK_FALSE,
-			.depthCompareOp = 0,
+			.depthTestEnable = VK_TRUE,
+			.depthWriteEnable = VK_TRUE,
+			.depthCompareOp = VK_COMPARE_OP_LESS,
 			.depthBoundsTestEnable = VK_FALSE,
 			.stencilTestEnable = VK_FALSE,
 			.front = { 0 },
 			.back = { 0 },
-			.minDepthBounds = 0,
-			.maxDepthBounds = 0,
+			.minDepthBounds = 0.0,
+			.maxDepthBounds = 1.0,
 		},
 		.pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
@@ -1122,27 +1399,6 @@ setupgpu(void)
 	if (res != VK_SUCCESS) {
 		cleanupgpu(POOL);
 		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
-	}
-
-	/* TODO: Do this during usabledev */
-	VkPhysicalDeviceMemoryProperties2 memprops = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
-		.pNext = NULL,
-	};
-	vkGetPhysicalDeviceMemoryProperties2(physdev, &memprops);
-	int64_t memidx = -1;
-	for (size_t i = 0; i < memprops.memoryProperties.memoryTypeCount; i++) {
-		VkMemoryPropertyFlags flags =
-			memprops.memoryProperties.memoryTypes[i].propertyFlags;
-		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-				(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-			memidx = i;
-			break;
-		}
-	}
-	if (memidx < 0) {
-		cleanupgpu(DESCRIPTOR_POOL);
-		errx(1, "couldn't find usable device memory");
 	}
 
 	/* TODO: put these bad bois in variables (size) */
@@ -1363,19 +1619,13 @@ render(void)
 		const float *ogbox = bounds[i].orig.extent;
 		mat4x4_identity(A);
 		mat4x4_scale_aniso(model, A,
-			(box[0] / width) / ogbox[0],
-			(box[1] / height) / ogbox[1],
-			(box[2] / depth) / ogbox[2]);
-		mat4x4_translate(A,
-			2*off[0] / width,
-			2*off[1] / height,
-			2*off[2] / depth);
+			box[0] / ogbox[0],
+			box[1] / ogbox[1],
+			box[2] / ogbox[2]);
+		mat4x4_translate(A, off[0], off[1], off[2]);
 		mat4x4_mul(model, A, model);
-		mat4x4_look_at(view,
-			(vec3){ 0, 0, -1 },
-			(vec3){ 0, 0, 0 },
-			(vec3){ 0, -1, 0 });
-		mat4x4_perspective(proj, 120, width/height, -1.0, 1.0);
+		mat4x4_look_at(view, camera, target, (vec3){ 0, -1, 0 });
+		mat4x4_perspective(proj, 120, width/height, 0.0, 1.0);
 		mat4x4_mul(A, view, model);
 		mat4x4_mul(transforms[i], proj, A);
 		mat4x4_dup(models[i], model);
@@ -1417,9 +1667,14 @@ render(void)
 			.offset = { .x = (1-meshpct)*width, .y = 0 },
 			.extent = { .width = meshpct*width, .height = height },
 		},
-		.clearValueCount = 1,
+		.clearValueCount = 2,
 		.pClearValues = (VkClearValue[]) { {
 				.color = { .float32 = { 0.6, 0.6, 0.6, 1.0 } },
+			}, {
+				.depthStencil = {
+					.depth = 1.0,
+					.stencil = 0,
+				},
 			}
 		  },
 	}, VK_SUBPASS_CONTENTS_INLINE);
@@ -1466,12 +1721,6 @@ render(void)
 
 free_dset:
 	vkResetDescriptorPool(device, dpool, 0);
-}
-
-static int64_t
-nanotimerdiff(struct timespec a, struct timespec b)
-{
-	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
 }
 
 int
