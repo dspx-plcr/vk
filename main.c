@@ -99,6 +99,7 @@ static size_t meshsz;
 static struct bounds *bounds;
 static vec3 camera;
 static vec3 target;
+static vec3 up;
 static mat4x4 *transforms;
 static mat4x4 *models;
 
@@ -110,6 +111,20 @@ static int64_t
 nanotimerdiff(struct timespec a, struct timespec b)
 {
 	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
+}
+
+static void
+resetcamera(void)
+{
+	target[0] = 0;
+	target[1] = 0;
+	target[2] = 0;
+	up[0] = 0;
+	up[1] = -1;
+	up[2] = 0;
+	camera[0] = 0;
+	camera[1] = height/4;
+	camera[2] = depth/2;
 }
 
 static const char *
@@ -357,6 +372,8 @@ keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 	if ((key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
 	    		&& action == GLFW_PRESS)
 		glfwSetWindowShouldClose(win, GLFW_TRUE);
+	if (key == GLFW_KEY_R)
+		resetcamera();
 }
 
 static void
@@ -396,8 +413,7 @@ cart2sph(vec3 sph, vec3 cart)
 
 	double r = sqrt(x*x + y*y + z*z);
 	double t = atan2(x, z);
-	double p = asin(z / r);
-	if (y < 0) p = -p;
+	double p = asin(y / r);
 
 	sph[0] = r;
 	sph[1] = t;
@@ -434,16 +450,25 @@ cursorcb(GLFWwindow *win, double x, double y)
 {
 	(void)win;
 	if (panning) {
-		/* TODO: What we're doing here is nonsense */
 		vec2 dpos;
 		vec2_sub(dpos, lastmouse, (vec2){ x, y });
 		lastmouse[0] = x;
 		lastmouse[1] = y;
 
-		vec2_add(target, target, (vec2){
-			dpos[0] * panspeed,
-			dpos[1] * panspeed,
-		});
+		vec3 f, u, r;
+		vec3_sub(f, target, camera);
+		vec3_mul_cross(u, f, up);
+		vec3_mul_cross(r, f, u);
+		vec3_norm(u, u);
+		vec3_norm(r, r);
+		vec3_scale(u, u, panspeed * dpos[0]);
+		vec3_scale(r, r, -panspeed * dpos[1]);
+
+		vec3 diff = { 0, };
+		vec3_add(diff, diff, u);
+		vec3_add(diff, diff, r);
+		vec3_add(camera, camera, diff);
+		vec3_add(target, target, diff);
 	}
 
 	if (rotating) {
@@ -456,16 +481,21 @@ cursorcb(GLFWwindow *win, double x, double y)
 		vec3 shifted, shiftedP;
 		vec3_sub(shifted, camera, target);
 		cart2sph(shiftedP, shifted);
-		shiftedP[1] += rotspeed * dpos[0];
-		shiftedP[2] += rotspeed * dpos[1];
+		shiftedP[1] += up[1] * rotspeed * dpos[0];
+		shiftedP[2] += up[1] * rotspeed * dpos[1];
+		if (shiftedP[2] < -PI/2) {
+			shiftedP[1] += PI;
+			shiftedP[2] = -PI/2 + (-PI/2 - shiftedP[2]);
+			up[1] *= -1;
+		} else if (shiftedP[2] > PI/2) {
+			shiftedP[1] += PI;
+			shiftedP[2] = PI/2 - (shiftedP[2] - PI/2);
+			up[1] *= -1;
+		}
 		if (shiftedP[1] < 0)
 			shiftedP[1] += 2*PI;
 		else if (shiftedP[1] > 2*PI)
 			shiftedP[1] -= 2*PI;
-		if (shiftedP[2] < -PI/2)
-			shiftedP[2] += PI;
-		else if (shiftedP[2] > PI/2)
-			shiftedP[2] -= PI;
 		sph2cart(shifted, shiftedP);
 		vec3_add(camera, target, shifted);
 	}
@@ -525,15 +555,24 @@ setupcpu(void)
 				int res = fscanf(fs[i], "%f %f %f\n%f %f %f\n",
 					vert, vert+1, vert+2,
 					vert+3, vert+4, vert+5);
-				if (res == EOF)
-					err(1, "couldn't read data from %s",
-						files[i]);
+				if (res == EOF) {
+					if (ferror(fs[i]))
+						err(1, "couldn't read data from"
+							" %s", files[i]);
+					errx(1, "couldn't read data from %s:"
+						" unexpected EOF", files[i]);
+				}
 				expandbox(&b, vert, 0);
 				expandbox(&b, vert, 1);
 				expandbox(&b, vert, 2);
 			}
-			if (fscanf(fs[i], "\n") == EOF)
-				err(1, "couldn't read data from %s", files[i]);
+			if (fscanf(fs[i], "\n") == EOF) {
+				if (ferror(fs[i]))
+					err(1, "couldn't read data from %s",
+						files[i]);
+				errx(1, "couldn't read data from %s:"
+					" unexpected EOF", files[i]);
+			}
 		}
 		fclose(fs[i]);
 
@@ -542,12 +581,7 @@ setupcpu(void)
 		vec4_scale(bounds[i].curr.extent, b.extent, 40);
 	}
 
-	target[0] = 0;
-	target[1] = 0;
-	target[2] = 0;
-	camera[0] = 0;
-	camera[1] = height/4;
-	camera[2] = depth/2;
+	resetcamera();
 }
 
 static void
@@ -1013,15 +1047,14 @@ setupgpu(void)
 			.preserveAttachmentCount = 0,
 			.pPreserveAttachments = NULL,
 		},
-		/* TODO: what's going on here */
 		.dependencyCount = 1,
 		.pDependencies = (VkSubpassDependency[]){{
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.dstSubpass = 0,
-				.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-				.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-				.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 			},
 		},
 	}, NULL /* allocator */, &renderpass);
@@ -1053,7 +1086,7 @@ setupgpu(void)
 	}, NULL /* allocator */, &depthbuf);
 	if (res != VK_SUCCESS) {
 		cleanupgpu(IMAGE_VIEWS);
-		errx(1, "could't not create image for depth buffer: %s",
+		errx(1, "couldn't create image for depth buffer: %s",
 			vkstrerror(res));
 	}
 
@@ -1302,8 +1335,8 @@ setupgpu(void)
 			.depthClampEnable = VK_FALSE,
 			.rasterizerDiscardEnable = VK_FALSE,
 			.polygonMode = VK_POLYGON_MODE_FILL,
-			.cullMode = VK_CULL_MODE_BACK_BIT,
-			.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+			.cullMode = VK_CULL_MODE_NONE,
+			.frontFace = VK_FRONT_FACE_CLOCKWISE,
 			.depthBiasEnable = VK_FALSE,
 			.depthBiasConstantFactor = 0,
 			.depthBiasClamp = 0,
@@ -1327,7 +1360,7 @@ setupgpu(void)
 			.flags = 0,
 			.depthTestEnable = VK_TRUE,
 			.depthWriteEnable = VK_TRUE,
-			.depthCompareOp = VK_COMPARE_OP_LESS,
+			.depthCompareOp = VK_COMPARE_OP_GREATER,
 			.depthBoundsTestEnable = VK_FALSE,
 			.stencilTestEnable = VK_FALSE,
 			.front = { 0 },
@@ -1624,8 +1657,8 @@ render(void)
 			box[2] / ogbox[2]);
 		mat4x4_translate(A, off[0], off[1], off[2]);
 		mat4x4_mul(model, A, model);
-		mat4x4_look_at(view, camera, target, (vec3){ 0, -1, 0 });
-		mat4x4_perspective(proj, 120, width/height, 0.0, 1.0);
+		mat4x4_look_at(view, camera, target, up);
+		mat4x4_perspective(proj, 120, width/height, -1, 1);
 		mat4x4_mul(A, view, model);
 		mat4x4_mul(transforms[i], proj, A);
 		mat4x4_dup(models[i], model);
@@ -1672,7 +1705,7 @@ render(void)
 				.color = { .float32 = { 0.6, 0.6, 0.6, 1.0 } },
 			}, {
 				.depthStencil = {
-					.depth = 1.0,
+					.depth = 0,
 					.stencil = 0,
 				},
 			}
@@ -1690,7 +1723,7 @@ render(void)
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores = (VkSemaphore[]){ acquiresem },
 		.pWaitDstStageMask = (VkPipelineStageFlags[]){
-			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		},
 		.commandBufferCount = 1,
 		.pCommandBuffers = (VkCommandBuffer[]){
