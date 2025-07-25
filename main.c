@@ -18,7 +18,7 @@
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define PI ((double)3.14159265358979323846)
 
-struct display {
+static struct {
 	GLFWwindow *window;
 	VkSurfaceKHR surface;
 	VkSwapchainKHR swapchain;
@@ -34,8 +34,32 @@ struct display {
 	VkSurfaceCapabilitiesKHR caps;
 	VkSurfaceFormatKHR fmt;
 	VkPresentModeKHR mode;
-	
-};
+} display;
+
+static struct {
+	VkDescriptorSetLayout dsetlayout;
+	VkPipelineLayout layout;
+	VkPipeline pipeline;
+	VkShaderModule vertshader;
+	VkShaderModule fragshader;
+	VkDeviceMemory memory;
+	VkBuffer vertbuf;
+	VkBuffer transbuf;
+	VkBuffer modelbuf;
+} modelpipeline;
+
+static struct {
+	VkRenderPass pass;
+	VkDescriptorPool dpool;
+	VkCommandPool cpool;
+	VkFence fence;
+	VkSemaphore acquiresem;
+	VkCommandBuffer cmdbuf;
+	VkDeviceMemory memory;
+
+	VkImage modeldepth;
+	VkImageView mdview;
+} renderer;
 
 static const char *progname = "My Little Vulkan App";
 static const float width = 1920;
@@ -50,25 +74,7 @@ static const double zoomspeed = 70;
 static VkInstance instance;
 static VkDevice device;
 static uint32_t qfamidx;
-static struct display display;
-static VkRenderPass renderpass;
-static VkImage depthbuf;
-static VkImageView depthview;
-static VkDeviceMemory depthmem;
-static VkDescriptorSetLayout dsetlayout;
-static VkDescriptorPool dpool;
-static VkPipelineLayout layout;
-static VkShaderModule vertshader;
-static VkShaderModule fragshader;
-static VkPipeline pipeline;
-static VkCommandPool pool;
-static VkDeviceMemory memory;
-static VkBuffer vertbuf;
-static VkBuffer transbuf;
-static VkBuffer modelbuf;
-static VkFence fence;
-static VkSemaphore acquiresem;
-static VkCommandBuffer cmdbuf;
+static uint32_t memidx;
 
 struct boundingbox {
 	vec3 offset;
@@ -114,7 +120,7 @@ nanotimerdiff(struct timespec a, struct timespec b)
 }
 
 static void
-resetcamera(void)
+reset_camera(void)
 {
 	target[0] = 0;
 	target[1] = 0;
@@ -156,19 +162,30 @@ vkstrerror(VkResult res)
 	}
 }
 
-static char
-usabledev(VkPhysicalDevice dev, VkPhysicalDeviceProperties2 props)
-{
+static bool
+usabledev(
+	VkPhysicalDevice dev,
+	VkPhysicalDeviceProperties2 props,
+	uint32_t *outqfamidx,
+	uint32_t *outmemidx
+) {
 	if (VK_API_VERSION_MAJOR(props.properties.apiVersion) != 1 ||
 			VK_API_VERSION_MINOR(props.properties.apiVersion) < 1)
-		return 0;
+		return false;
 
 	if (props.properties.limits.maxViewportDimensions[0] < width ||
 			props.properties.limits.maxViewportDimensions[1] < height)
-		return 0;
+		return false;
 
 	uint32_t qcnt;
 	vkGetPhysicalDeviceQueueFamilyProperties2(dev, &qcnt, NULL);
+	if (SIZE_MAX / sizeof(VkQueueFamilyProperties2) < (size_t)qcnt ||
+			(size_t)qcnt != qcnt) {
+		warnx("can't allocate space for %zu queue family properties"
+			" (%zu * sizeof(VkQueueFamilyProperties2) > SIZE_MAX)",
+			qcnt, qcnt);
+		return false;
+	}
 	VkQueueFamilyProperties2 *qprops =
 		malloc(sizeof(VkQueueFamilyProperties2) * qcnt);
 	if (qprops == NULL)
@@ -179,120 +196,70 @@ usabledev(VkPhysicalDevice dev, VkPhysicalDeviceProperties2 props)
 			.pNext = NULL,
 		};
 	vkGetPhysicalDeviceQueueFamilyProperties2(dev, &qcnt, qprops);
-	char found = 0;
+	bool found = false;
 	for (size_t i = 0; i < qcnt; i++) {
 		VkQueueFlags flags = qprops[i].queueFamilyProperties.queueFlags;
 		if (!(flags & VK_QUEUE_GRAPHICS_BIT))
 			continue;
 		if (glfwGetPhysicalDevicePresentationSupport(
 				instance, dev, i)) {
-			found = 1;
-			qfamidx = i;
+			found = true;
+			*outqfamidx = i;
 			break;
 		}
 	}
 	free(qprops);
+	if (!found)
+		return false;
+
+	VkPhysicalDeviceMemoryProperties2 memprops = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
+		.pNext = NULL,
+	};
+	vkGetPhysicalDeviceMemoryProperties2(dev, &memprops);
+	VkPhysicalDeviceMemoryProperties mp = memprops.memoryProperties;
+	found = false;
+	for (size_t i = 0; i < mp.memoryTypeCount; i++) {
+		VkMemoryPropertyFlags flags = mp.memoryTypes[i].propertyFlags;
+		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+				(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+			*outmemidx = i;
+			found = true;
+			break;
+		}
+	}
+
 	return found;
 }
 
-static char
+static bool
 preferdev(VkPhysicalDeviceProperties2 new, VkPhysicalDeviceProperties2 old)
 {
 	if (old.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU)
-		return 1;
+		return true;
 	if (new.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU &&
 			old.properties.deviceType !=
 			VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-		return 1;
+		return true;
 
-	return 0;
+	return false;
 }
 
-enum stage {
+enum displaystage {
 	INSTANCE,
 	SURFACE,
 	DEVICE,
 	SWAP_CHAIN,
 	SEMAPHORES,
 	IMAGE_VIEWS,
-	RENDER_PASS,
-	DEPTH_BUFFER,
-	DEPTH_MEMORY,
-	DEPTH_VIEW,
-	FRAMEBUFFERS,
-	DESCRIPTOR_SET_LAYOUT,
-	LAYOUT,
-	VERT_SHADER,
-	FRAG_SHADER,
-	SHADERS,
-	PIPELINE,
-	POOL,
-	DESCRIPTOR_POOL,
-	VERTEX_BUFFER,
-	TRANSFORM_BUFFER,
-	MODEL_BUFFER,
-	DEVICE_MEMORY,
-	UNMAP_TRANSFORMS,
-	FENCE,
-	ACQUIRE_SEMAPHORE,
-	COMMAND_BUFFER,
-	ALL,
+	DISPLAY_ALL,
 };
 
 static void
-cleanupgpu(enum stage s)
+cleanup_display(enum displaystage stage)
 {
-	switch (s) {
-		VkQueue queue;
-	case ALL:
-		vkGetDeviceQueue(device, qfamidx, 0, &queue);
-		vkQueueWaitIdle(queue);
-		vkDeviceWaitIdle(device);
-	case COMMAND_BUFFER:
-		vkFreeCommandBuffers(device, pool, 1, &cmdbuf);
-	case ACQUIRE_SEMAPHORE:
-		vkDestroySemaphore(device, acquiresem, NULL /* allocator */);
-	case FENCE:
-		vkDestroyFence(device, fence, NULL /* allocator */);
-	case UNMAP_TRANSFORMS:
-		vkUnmapMemory(device, memory);
-	case DEVICE_MEMORY:
-		vkFreeMemory(device, memory, NULL /* allocator */);
-	case MODEL_BUFFER:
-		vkDestroyBuffer(device, modelbuf, NULL /* allocator */);
-	case TRANSFORM_BUFFER:
-		vkDestroyBuffer(device, transbuf, NULL /* allocator */);
-	case VERTEX_BUFFER:
-		vkDestroyBuffer(device, vertbuf, NULL /* allocator */);
-	case DESCRIPTOR_POOL:
-		vkDestroyDescriptorPool(device, dpool, NULL /* allocator */);
-	case POOL:
-		vkDestroyCommandPool(device, pool, NULL /* allocator */);
-	case PIPELINE:
-		vkDestroyPipeline(device, pipeline, NULL /* allocator */);
-	case SHADERS:
-	case FRAG_SHADER:
-		vkDestroyShaderModule(device, fragshader, NULL /* allocator */);
-	case VERT_SHADER:
-		vkDestroyShaderModule(device, vertshader, NULL /* allocator */);
-	case LAYOUT:
-		vkDestroyPipelineLayout(device, layout, NULL /* allocator */);
-	case DESCRIPTOR_SET_LAYOUT:
-		vkDestroyDescriptorSetLayout(
-			device, dsetlayout, NULL /* allocator */);
-	case FRAMEBUFFERS:
-		for (size_t i = 0; i < display.nfbs; i++)
-			vkDestroyFramebuffer(device, display.framebuffers[i],
-				NULL /* allocator */);
-		display.nfbs = 0;
-	case DEPTH_VIEW:
-		vkDestroyImageView(device, depthview, NULL /* allocator */);
-	case DEPTH_MEMORY:
-		vkFreeMemory(device, depthmem, NULL /* allocator */);
-	case DEPTH_BUFFER:
-		vkDestroyImage(device, depthbuf, NULL /* allocator */);
-	case RENDER_PASS:
-		vkDestroyRenderPass(device, renderpass, NULL /* allocator */);
+	switch (stage) {
+	case DISPLAY_ALL:
 	case IMAGE_VIEWS:
 		for (size_t i = 0; i < display.nviews; i++)
 			vkDestroyImageView(device, display.views[i],
@@ -316,32 +283,168 @@ cleanupgpu(enum stage s)
 	}
 }
 
+enum modelpipelinestage {
+	DESCRIPTOR_SET_LAYOUT,
+	LAYOUT,
+	VERT_SHADER,
+	FRAG_SHADER,
+	SHADERS,
+	PIPELINE,
+	VERTEX_BUFFER,
+	TRANSFORM_BUFFER,
+	MODEL_BUFFER,
+	DEVICE_MEMORY,
+	UNMAP_TRANSFORMS,
+	MODEL_PIPELINE_ALL,
+};
+
+static void
+cleanup_modelpipeline(enum modelpipelinestage stage)
+{
+	switch (stage) {
+	case MODEL_PIPELINE_ALL:
+	case UNMAP_TRANSFORMS:
+		vkUnmapMemory(device, modelpipeline.memory);
+	case DEVICE_MEMORY:
+		vkFreeMemory(device, modelpipeline.memory,
+			NULL /* allocator */);
+	case MODEL_BUFFER:
+		vkDestroyBuffer(device, modelpipeline.modelbuf,
+			NULL /* allocator */);
+	case TRANSFORM_BUFFER:
+		vkDestroyBuffer(device, modelpipeline.transbuf,
+			NULL /* allocator */);
+	case VERTEX_BUFFER:
+		vkDestroyBuffer(device, modelpipeline.vertbuf,
+			NULL /* allocator */);
+	case PIPELINE:
+		vkDestroyPipeline(device, modelpipeline.pipeline,
+			NULL /* allocator */);
+	case SHADERS:
+	case FRAG_SHADER:
+		vkDestroyShaderModule(device, modelpipeline.fragshader,
+			NULL /* allocator */);
+	case VERT_SHADER:
+		vkDestroyShaderModule(device, modelpipeline.vertshader,
+			NULL /* allocator */);
+	case LAYOUT:
+		vkDestroyPipelineLayout(device, modelpipeline.layout,
+			NULL /* allocator */);
+	case DESCRIPTOR_SET_LAYOUT:
+		vkDestroyDescriptorSetLayout(device, modelpipeline.dsetlayout,
+			NULL /* allocator */);
+	}
+}
+
+enum rendererstage {
+	DESCRIPTOR_POOL,
+	DEPTH_BUFFER,
+	DEPTH_MEMORY,
+	DEPTH_VIEW,
+	FRAMEBUFFERS,
+	RENDER_PASS,
+	POOL,
+	ACQUIRE_SEMAPHORE,
+	COMMAND_BUFFER,
+	FENCE,
+	RENDERER_ALL,
+};
+
+static void
+cleanup_renderer(enum rendererstage s)
+{
+	switch (s) {
+	case RENDERER_ALL:
+	case FENCE:
+		vkDestroyFence(device, renderer.fence, NULL /* allocator */);
+	case COMMAND_BUFFER:
+		vkFreeCommandBuffers(device, renderer.cpool, 1,
+			&renderer.cmdbuf);
+	case ACQUIRE_SEMAPHORE:
+		vkDestroySemaphore(device, renderer.acquiresem,
+			NULL /* allocator */);
+	case POOL:
+		vkDestroyCommandPool(device, renderer.cpool,
+			NULL /* allocator */);
+	case FRAMEBUFFERS:
+		for (size_t i = 0; i < display.nfbs; i++)
+			vkDestroyFramebuffer(device, display.framebuffers[i],
+				NULL /* allocator */);
+		display.nfbs = 0;
+	case RENDER_PASS:
+		vkDestroyRenderPass(device, renderer.pass,
+			NULL /* allocator */);
+	case DEPTH_VIEW:
+		vkDestroyImageView(device, renderer.mdview,
+			NULL /* allocator */);
+	case DEPTH_MEMORY:
+		vkFreeMemory(device, renderer.memory, NULL /* allocator */);
+	case DEPTH_BUFFER:
+		vkDestroyImage(device, renderer.modeldepth,
+			NULL /* allocator */);
+	case DESCRIPTOR_POOL:
+		vkDestroyDescriptorPool(device, renderer.dpool,
+			NULL /* allocator */);
+	}
+}
+
+enum gpustage {
+	DISPLAY,
+	RENDERER,
+	MODEL_PIPELINE,
+	END,
+};
+
+static void
+cleanup_before(enum gpustage stage)
+{
+	switch (stage) {
+		VkQueue queue;
+	case END:
+		vkGetDeviceQueue(device, qfamidx, 0, &queue);
+		vkQueueWaitIdle(queue);
+		vkDeviceWaitIdle(device);
+		cleanup_modelpipeline(MODEL_PIPELINE_ALL);
+	case MODEL_PIPELINE:
+		cleanup_renderer(RENDERER_ALL);
+	case RENDERER:
+		cleanup_display(DISPLAY_ALL);
+	case DISPLAY:
+		break;
+	}
+}
+
 static VkShaderModule
-readshader(const char *filename, enum stage toclean)
+read_shader(const char *filename, enum modelpipelinestage toclean)
 {
 	FILE *f = fopen(filename, "rb");
 	if (f == NULL) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't open shader file for reading");
 	}
 	if (fseek(f, 0, SEEK_END) < 0) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't seek to end of shader file");
 	}
 	size_t codesz = ftell(f);
 	if (fseek(f, 0, SEEK_SET) < 0) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't seek to start of shader file");
 	}
 	uint32_t *code = malloc(codesz);
 	if (code == NULL) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't allocate for shader code");
 	}
 	/* TODO: is endianness an issue here? */
 	size_t num = fread(code, 1, codesz, f);
 	if (num != codesz) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		if (ferror(f))
 			err(1, "couldn't read shader code into buffer");
 	}
@@ -357,7 +460,8 @@ readshader(const char *filename, enum stage toclean)
 		.pCode = code,
 	}, NULL /* allocator */, &shader);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(toclean);
+		cleanup_modelpipeline(toclean);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create shader module: %s", vkstrerror(res));
 	}
 
@@ -370,10 +474,10 @@ keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 	(void)scancode;
 	(void)mods;
 	if ((key == GLFW_KEY_ESCAPE || key == GLFW_KEY_Q)
-	    		&& action == GLFW_PRESS)
+			&& action == GLFW_PRESS)
 		glfwSetWindowShouldClose(win, GLFW_TRUE);
 	if (key == GLFW_KEY_R)
-		resetcamera();
+		reset_camera();
 }
 
 static void
@@ -502,7 +606,7 @@ cursorcb(GLFWwindow *win, double x, double y)
 }
 
 static void
-expandbox(struct boundingbox *box, vec3 point, size_t axis)
+expand_box(struct boundingbox *box, vec3 point, size_t axis)
 {
 	if (box->extent[axis] < 0) {
 		box->offset[axis] = point[axis];
@@ -516,7 +620,7 @@ expandbox(struct boundingbox *box, vec3 point, size_t axis)
 
 /* TODO: decouple objects from meshes */
 static void
-setupcpu(void)
+setup_cpu(void)
 {
 	const char *files[] = {
 		"teapot.norm",
@@ -562,9 +666,9 @@ setupcpu(void)
 					errx(1, "couldn't read data from %s:"
 						" unexpected EOF", files[i]);
 				}
-				expandbox(&b, vert, 0);
-				expandbox(&b, vert, 1);
-				expandbox(&b, vert, 2);
+				expand_box(&b, vert, 0);
+				expand_box(&b, vert, 1);
+				expand_box(&b, vert, 2);
 			}
 			if (fscanf(fs[i], "\n") == EOF) {
 				if (ferror(fs[i]))
@@ -581,11 +685,11 @@ setupcpu(void)
 		vec4_scale(bounds[i].curr.extent, b.extent, 40);
 	}
 
-	resetcamera();
+	reset_camera();
 }
 
 static void
-setupgpu(void)
+setup_display(void)
 {
 	VkResult res;
 
@@ -620,13 +724,20 @@ setupgpu(void)
 		(void)glfwGetError(&msg);
 		errx(1, "couldn't get required vulkan extensions: %s", msg);
 	}
-	/* TODO: technically can overflow */
-	const char **exts = malloc(
-		sizeof(char **) * (numglfwexts + ARR_SZ(manualexts)));
+	if (SIZE_MAX - numglfwexts < ARR_SZ(manualexts))
+		errx(1, "can't allocate more than SIZE_MAX (%zu) extensions:"
+			" GLFW requested %zu and we requested %zu", numglfwexts,
+			ARR_SZ(manualexts));
+	size_t nexts = numglfwexts + ARR_SZ(manualexts);
+	if (SIZE_MAX / sizeof(char **) < nexts)
+		errx(1, "can't allocate space for %zu extensions"
+			" (%zu * sizeof(char **) > SIZE_MAX)", nexts);
+
+	const char **exts = malloc(sizeof(char **) * nexts);
 	if (exts == NULL)
 		err(1, "couldn't allocate for instance extensions");
-	memcpy(exts, glfwexts, sizeof(char *)*numglfwexts);
-	memcpy(exts+numglfwexts, manualexts, sizeof(manualexts));
+	memcpy(exts, glfwexts, sizeof(char *) * numglfwexts);
+	memcpy(exts + numglfwexts, manualexts, sizeof(manualexts));
 	res = vkCreateInstance(&(VkInstanceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
 		.pNext = &(VkValidationFeaturesEXT) {
@@ -660,6 +771,7 @@ setupgpu(void)
 	if (res != VK_SUCCESS)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
+	/* TODO: allow resizing and window decorations */
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 	glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
@@ -670,14 +782,16 @@ setupgpu(void)
 		const char *msg;
 		(void)glfwGetError(&msg);
 		glfwTerminate();
-		cleanupgpu(INSTANCE);
+		cleanup_display(INSTANCE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't create a GLFW window: %s", msg);
 	}
 
 	res = glfwCreateWindowSurface(instance, display.window,
 		NULL /* allocator */, &display.surface);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(INSTANCE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't create surface for window: %s",
 			vkstrerror(res));
 	}
@@ -689,65 +803,76 @@ setupgpu(void)
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
 		errx(1, "coudln't get number of physical devices: %s",
 			vkstrerror(res));
 	}
+	if (SIZE_MAX / sizeof(VkPhysicalDevice) < (size_t)devcnt ||
+			(size_t)devcnt != devcnt) {
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate space for %zu devices"
+			" (%zu * sizeof(VkPhysicalDevice) > SIZE_MAX)", devcnt);
+	}
 	VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * devcnt);
 	if (devs == NULL) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate to store physical devices");
 	}
 	size_t devcap = devcnt;
 	while ((res = vkEnumeratePhysicalDevices(instance, &devcnt, devs))
 			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkPhysicalDevice) > devcap) {
-			cleanupgpu(INSTANCE);
+			cleanup_display(SURFACE);
+			cleanup_before(DISPLAY);
 			errx(1, "can't store %zu physical devices", devcap);
 		}
 		devcap *= 2;
 		VkPhysicalDevice *tmp = realloc(
 			devs, sizeof(VkPhysicalDevice) * devcap);
 		if (tmp == NULL) {
-			cleanupgpu(INSTANCE);
+			cleanup_display(SURFACE);
+			cleanup_before(DISPLAY);
 			err(1, "coudln't allocate to store physical devices");
 		}
 		devs = tmp;
 		devcnt = devcap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't get physical devices: %s", vkstrerror(res));
 	}
 
 	VkPhysicalDevice physdev;
 	VkPhysicalDeviceProperties2 devprops;
-	char found = 0;
+	bool found = false;
 	for (size_t i = 0; i < devcnt; i++) {
 		VkPhysicalDeviceProperties2 props = {
 			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
 			.pNext = NULL,
 		};
 		vkGetPhysicalDeviceProperties2(devs[i], &props);
-		if (!usabledev(devs[i], props))
+		uint32_t qidx, midx;
+		if (!usabledev(devs[i], props, &qidx, &midx))
 			continue;
 
-		if (!found) {
+		if (!found || preferdev(props, devprops)) {
 			physdev = devs[i];
 			devprops = props;
-			found = 1;
+			qfamidx = qidx;
+			memidx = midx;
+			found = true;
 			continue;
-		}
-
-		if (preferdev(props, devprops)) {
-			physdev = devs[i];
-			devprops = props;
 		}
 	}
 	free(devs);
 
 	if (!found) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't find a compatible GPU");
 	}
 
@@ -773,7 +898,8 @@ setupgpu(void)
 		.pEnabledFeatures = NULL,
 	}, NULL /* allocator */, &device);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(INSTANCE);
+		cleanup_display(SURFACE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't create logical device: %s", vkstrerror(res));
 	}
 
@@ -781,7 +907,8 @@ setupgpu(void)
 	res = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
 		physdev, display.surface, &caps);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't query for surface capabilities: %s",
 			vkstrerror(res));
 	}
@@ -795,15 +922,21 @@ setupgpu(void)
 	res = vkGetPhysicalDeviceSurfaceFormats2KHR(
 		physdev, &surfinfo, &fmtcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't query for surface formats: %s",
 			vkstrerror(res));
 	}
 	size_t fmtcap = fmtcnt;
-	/* TODO: can overflow */
+	if (SIZE_MAX / sizeof(VkSurfaceFormat2KHR) < fmtcap) {
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate %zu surface formats");
+	}
 	VkSurfaceFormat2KHR *fmts = malloc(sizeof(VkSurfaceFormat2KHR)*fmtcap);
 	if (fmts == NULL) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate for surface formats");
 	}
 	for (size_t i = 0; i < fmtcnt; i++)
@@ -815,14 +948,16 @@ setupgpu(void)
 			physdev, &surfinfo, &fmtcnt, fmts))
 			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkSurfaceFormat2KHR) > fmtcap) {
-			cleanupgpu(DEVICE);
+			cleanup_display(DEVICE);
+			cleanup_before(DISPLAY);
 			errx(1, "can't store %zu physical devices", fmtcap);
 		}
 		fmtcap *= 2;
 		VkSurfaceFormat2KHR *tmp = realloc(
 			fmts, sizeof(VkSurfaceFormat2KHR) * fmtcap);
 		if (tmp == NULL) {
-			cleanupgpu(DEVICE);
+			cleanup_display(DEVICE);
+			cleanup_before(DISPLAY);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		fmts = tmp;
@@ -834,7 +969,8 @@ setupgpu(void)
 		fmtcnt = fmtcap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
 	}
 
@@ -842,36 +978,45 @@ setupgpu(void)
 	res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 		physdev, display.surface, &modecnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't query for surface formats: %s",
 			vkstrerror(res));
 	}
 	size_t modecap = modecnt;
-	/* TODO: can overflow */
+	if (SIZE_MAX / sizeof(VkPresentModeKHR) < modecap) {
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate %zu present modes", modecap);
+	}
 	VkPresentModeKHR *modes = malloc(sizeof(VkPresentModeKHR)*modecap);
 	if (modes == NULL) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate for surface formats");
 	}
 	while ((res = vkGetPhysicalDeviceSurfacePresentModesKHR(
 			physdev, display.surface, &modecnt, modes))
 			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkPresentModeKHR) > modecap) {
-			cleanupgpu(DEVICE);
+			cleanup_display(DEVICE);
+			cleanup_before(DISPLAY);
 			errx(1, "can't store %zu physical devices", modecap);
 		}
 		modecap *= 2;
 		VkPresentModeKHR *tmp = realloc(
 			modes, sizeof(VkPresentModeKHR) * modecap);
 		if (tmp == NULL) {
-			cleanupgpu(DEVICE);
+			cleanup_display(DEVICE);
+			cleanup_before(DISPLAY);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		modes = tmp;
 		modecnt = modecap;
 	}
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't get surface formats: %s", vkstrerror(res));
 	}
 
@@ -909,34 +1054,43 @@ setupgpu(void)
 		.oldSwapchain = VK_NULL_HANDLE,
 	}, NULL /* allocator */, &display.swapchain);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE);
+		cleanup_display(DEVICE);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
 	}
 
 	uint32_t imcnt;
 	res = vkGetSwapchainImagesKHR(device, display.swapchain, &imcnt, NULL);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(SWAP_CHAIN);
+		cleanup_display(SWAP_CHAIN);
+		cleanup_before(DISPLAY);
 		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
 	}
 	size_t imcap = imcnt;
-	/* TODO: can overflow */
+	if (SIZE_MAX / sizeof(VkImage) < imcap) {
+		cleanup_display(SWAP_CHAIN);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate %zu images", imcap);
+	}
 	VkImage *ims = malloc(sizeof(VkImage) * imcap);
 	if (ims == NULL) {
-		cleanupgpu(SWAP_CHAIN);
+		cleanup_display(SWAP_CHAIN);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate memory for images");
 	}
 	while ((res = vkGetSwapchainImagesKHR(
 			device, display.swapchain, &imcnt, ims))
 			== VK_INCOMPLETE) {
 		if (SIZE_MAX / 2 / sizeof(VkImage) > imcap) {
-			cleanupgpu(SWAP_CHAIN);
+			cleanup_display(SWAP_CHAIN);
+			cleanup_before(DISPLAY);
 			errx(1, "can't store %zu physical devices", imcap);
 		}
 		imcap *= 2;
 		VkImage *tmp = realloc(modes, sizeof(VkImage) * imcap);
 		if (tmp == NULL) {
-			cleanupgpu(SWAP_CHAIN);
+			cleanup_display(SWAP_CHAIN);
+			cleanup_before(DISPLAY);
 			err(1, "coudln't allocate to store surface formats");
 		}
 		ims = tmp;
@@ -945,9 +1099,16 @@ setupgpu(void)
 	display.images = ims;
 	display.nims = imcnt;
 
+	if (SIZE_MAX / sizeof(VkSemaphore) < (size_t)imcnt ||
+			(size_t)imcnt != imcnt) {
+		cleanup_display(SWAP_CHAIN);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate %zu semaphores", imcnt);
+	}
 	display.semaphores = malloc(sizeof(VkSemaphore) * imcnt);
 	if (display.semaphores == NULL) {
-		cleanupgpu(SWAP_CHAIN);
+		cleanup_display(SWAP_CHAIN);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate for semaphores");
 	}
 	display.nsems = 0;
@@ -958,15 +1119,23 @@ setupgpu(void)
 			.flags = 0,
 		}, NULL /* allocator */, display.semaphores+i);
 		if (res != VK_SUCCESS) {
-			cleanupgpu(SEMAPHORES);
+			cleanup_display(SEMAPHORES);
+			cleanup_before(DISPLAY);
 			errx(1, "couldn't create semaphore: %s", vkstrerror(res));
 		}
 		display.nsems++;
 	}
 
+	if (SIZE_MAX / sizeof(VkImageView) < (size_t)display.nims ||
+			(size_t)display.nims != display.nims) {
+		cleanup_display(SEMAPHORES);
+		cleanup_before(DISPLAY);
+		errx(1, "can't allocate %zu image views", display.nims);
+	}
 	display.views = malloc(sizeof(VkImageView) * display.nims);
 	if (display.views == NULL) {
-		cleanupgpu(SEMAPHORES);
+		cleanup_display(SEMAPHORES);
+		cleanup_before(DISPLAY);
 		err(1, "couldn't allocate for image views");
 	}
 	display.nviews = 0;
@@ -978,7 +1147,7 @@ setupgpu(void)
 			.image = display.images[i],
 			.viewType = VK_IMAGE_VIEW_TYPE_2D,
 			.format = display.fmt.format,
-			.components =  {
+			.components = {
 				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
 				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -993,209 +1162,18 @@ setupgpu(void)
 			}
 		}, NULL /* allocator */, display.views+i);
 		if (res != VK_SUCCESS) {
-			cleanupgpu(IMAGE_VIEWS);
+			cleanup_display(IMAGE_VIEWS);
+			cleanup_before(DISPLAY);
 			errx(1, "couldn't create image view: %s", vkstrerror(res));
 		}
 		display.nviews++;
 	}
+}
 
-	res = vkCreateRenderPass(device, &(VkRenderPassCreateInfo){
-		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
-		.pNext = NULL,
-		.flags = 0,
-		.attachmentCount = 2,
-		.pAttachments = (const VkAttachmentDescription[]){ {
-				.flags = 0,
-				.format = display.fmt.format,
-				.samples = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-			}, {
-				.flags = 0,
-				.format = VK_FORMAT_D32_SFLOAT,
-				.samples = VK_SAMPLE_COUNT_1_BIT,
-				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
-				.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
-				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-				.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-			},
-		  },
-		.subpassCount = 1,
-		.pSubpasses = &(VkSubpassDescription){
-			.flags = 0,
-			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.inputAttachmentCount = 0,
-			.pInputAttachments = NULL,
-			.colorAttachmentCount = 1,
-			.pColorAttachments = (VkAttachmentReference[]){ {
-					.attachment = 0,
-					.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-				},
-			 },
-			.pResolveAttachments = NULL,
-			.pDepthStencilAttachment = (VkAttachmentReference[]){ {
-					.attachment = 1,
-					.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-				},
-			},
-			.preserveAttachmentCount = 0,
-			.pPreserveAttachments = NULL,
-		},
-		.dependencyCount = 1,
-		.pDependencies = (VkSubpassDependency[]){{
-				.srcSubpass = VK_SUBPASS_EXTERNAL,
-				.dstSubpass = 0,
-				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-			},
-		},
-	}, NULL /* allocator */, &renderpass);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(IMAGE_VIEWS);
-		errx(1, "coudln't create render pass: %s", vkstrerror(res));
-	}
-
-	res = vkCreateImage(device, &(VkImageCreateInfo){
-		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-		.pNext = NULL,
-		.flags = 0,
-		.imageType = VK_IMAGE_TYPE_2D,
-		.format = VK_FORMAT_D32_SFLOAT,
-		.extent = {
-			.width = width,
-			.height = height,
-			.depth = 1,
-		},
-		.mipLevels = 1,
-		.arrayLayers = 1,
-		.samples = VK_SAMPLE_COUNT_1_BIT,
-		.tiling = VK_IMAGE_TILING_OPTIMAL,
-		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-		.queueFamilyIndexCount = 1,
-		.pQueueFamilyIndices = (uint32_t[]){ qfamidx },
-		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	}, NULL /* allocator */, &depthbuf);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(IMAGE_VIEWS);
-		errx(1, "couldn't create image for depth buffer: %s",
-			vkstrerror(res));
-	}
-
-	/* TODO: Do this during usabledev */
-	VkPhysicalDeviceMemoryProperties2 memprops = {
-		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2,
-		.pNext = NULL,
-	};
-	vkGetPhysicalDeviceMemoryProperties2(physdev, &memprops);
-	int64_t memidx = -1;
-	for (size_t i = 0; i < memprops.memoryProperties.memoryTypeCount; i++) {
-		VkMemoryPropertyFlags flags =
-			memprops.memoryProperties.memoryTypes[i].propertyFlags;
-		if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
-				(flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
-			memidx = i;
-			break;
-		}
-	}
-	if (memidx < 0) {
-		cleanupgpu(DEPTH_BUFFER);
-		errx(1, "couldn't find usable device memory");
-	}
-
-	VkMemoryRequirements2 imreqs = {
-		.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
-		.pNext = NULL,
-	};
-	vkGetImageMemoryRequirements2(device, &(VkImageMemoryRequirementsInfo2){
-		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
-		.pNext = NULL,
-		.image = depthbuf,
-	}, &imreqs);
-	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
-		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-		.pNext = NULL,
-		/* TODO: align */
-		.allocationSize = imreqs.memoryRequirements.size,
-		.memoryTypeIndex = (uint32_t)memidx,
-	}, NULL /* allocator */, &depthmem);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(DEPTH_BUFFER);
-		errx(1, "couldn't allocate memory for depth buffer: %s",
-			vkstrerror(res));
-	}
-
-	res = vkBindImageMemory2(device, 1, (VkBindImageMemoryInfo[]){{
-			.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
-			.pNext = NULL,
-			.image = depthbuf,
-			.memory = depthmem,
-			.memoryOffset = 0,
-		},
-	});
-	if (res != VK_SUCCESS) {
-		cleanupgpu(DEPTH_MEMORY);
-		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
-	}
-
-	res = vkCreateImageView(device, &(VkImageViewCreateInfo){
-		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-		.pNext = NULL,
-		.flags = 0,
-		.image = depthbuf,
-		.viewType = VK_IMAGE_VIEW_TYPE_2D,
-		.format = VK_FORMAT_D32_SFLOAT,
-		.components = { 0, },
-		.subresourceRange = {
-			.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
-			.baseMipLevel = 0,
-			.levelCount = 1,
-			.baseArrayLayer = 0,
-			.layerCount = 1,
-		}
-	}, NULL /* allocator */, &depthview);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(DEPTH_MEMORY);
-		errx(1, "couldn't create image view for depth buffer: %s",
-			vkstrerror(res));
-	}
-
-	display.framebuffers = malloc(sizeof(VkFramebuffer) * imcnt);
-	if (display.framebuffers == NULL) {
-		cleanupgpu(DEPTH_VIEW);
-		err(1, "couldn't not allocate for framebuffers");
-	}
-	display.nfbs = 0;
-	for (size_t i = 0; i < imcnt; i++) {
-		res = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-			.pNext = NULL,
-			.flags = 0,
-			.renderPass = renderpass,
-			.attachmentCount = 2,
-			.pAttachments = (VkImageView[]) {
-				display.views[i],
-				depthview,
-			},
-			.width = width,
-			.height = height,
-			.layers = 1,
-		}, NULL /* allocator */, display.framebuffers+i);
-		if (res != VK_SUCCESS) {
-			cleanupgpu(FRAMEBUFFERS);
-			errx(1, "coudln't allocate frame buffer: %s",
-				vkstrerror(res));
-		}
-		display.nfbs++;
-	}
+static void
+setup_modelpipeline(void)
+{
+	VkResult res;
 
 	res = vkCreateDescriptorSetLayout(device, &(VkDescriptorSetLayoutCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1216,9 +1194,10 @@ setupgpu(void)
 				.pImmutableSamplers = NULL,
 			},
 		},
-	}, NULL /* allocator */, &dsetlayout);
+	}, NULL /* allocator */, &modelpipeline.dsetlayout);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(FRAMEBUFFERS);
+		cleanup_renderer(RENDERER_ALL);
+		cleanup_before(RENDERER);
 		errx(1, "couldn't allocate descriptor set layout: %s",
 			vkstrerror(res));
 	}
@@ -1229,18 +1208,19 @@ setupgpu(void)
 		.flags = 0,
 		.setLayoutCount = 1,
 		.pSetLayouts = (VkDescriptorSetLayout[]){
-			dsetlayout,
+			modelpipeline.dsetlayout,
 		},
 		.pushConstantRangeCount = 0,
 		.pPushConstantRanges = NULL,
-	}, NULL /* allocator */, &layout);
+	}, NULL /* allocator */, &modelpipeline.layout);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DESCRIPTOR_SET_LAYOUT);
+		cleanup_modelpipeline(DESCRIPTOR_SET_LAYOUT);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
 	}
 
-	vertshader = readshader("vert.spv", LAYOUT);
-	fragshader = readshader("frag.spv", VERT_SHADER);
+	modelpipeline.vertshader = read_shader("vert.spv", LAYOUT);
+	modelpipeline.fragshader = read_shader("frag.spv", VERT_SHADER);
 
 	res = vkCreateGraphicsPipelines(device, NULL /* cache */, 1,
 			&(VkGraphicsPipelineCreateInfo){
@@ -1253,7 +1233,7 @@ setupgpu(void)
 				.pNext = NULL,
 				.flags = 0,
 				.stage = VK_SHADER_STAGE_VERTEX_BIT,
-				.module = vertshader,
+				.module = modelpipeline.vertshader,
 				.pName = "main",
 				.pSpecializationInfo = NULL,
 			}, {
@@ -1261,7 +1241,7 @@ setupgpu(void)
 			 	.pNext = NULL,
 			 	.flags = 0,
 			 	.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-			 	.module = fragshader,
+			 	.module = modelpipeline.fragshader,
 			 	.pName = "main",
 			 	.pSpecializationInfo = NULL,
 			},
@@ -1391,47 +1371,17 @@ setupgpu(void)
 			.blendConstants = { 0, 0, 0, 0 },
 		},
 		.pDynamicState = NULL,
-		.layout = layout,
-		.renderPass = renderpass,
+		.layout = modelpipeline.layout,
+		.renderPass = renderer.pass,
 		.subpass = 0,
 		.basePipelineHandle = 0,
 		.basePipelineIndex = 0,
-	}, NULL /* allocator */, &pipeline);
+	}, NULL /* allocator */, &modelpipeline.pipeline);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(SHADERS);
+		cleanup_modelpipeline(SHADERS);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create graphics pipeline: %s",
 			vkstrerror(res));
-	}
-
-	res = vkCreateCommandPool(device, &(VkCommandPoolCreateInfo){
-		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-		.pNext = NULL,
-		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
-		.queueFamilyIndex = qfamidx,
-	}, NULL /* allocator */, &pool);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(PIPELINE);
-		errx(1, "couldn't allocate command pool: %s", vkstrerror(res));
-	}
-
-	res = vkCreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-		.pNext = NULL,
-		.flags = 0,
-		.maxSets = 1,
-		.poolSizeCount = 2,
-		.pPoolSizes = (VkDescriptorPoolSize[]){ {
-				.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-				.descriptorCount = 1,
-			}, {
-				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-				.descriptorCount = 2,
-			},
-		},
-	}, NULL /* allocator */, &dpool);
-	if (res != VK_SUCCESS) {
-		cleanupgpu(POOL);
-		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
 	}
 
 	/* TODO: put these bad bois in variables (size) */
@@ -1447,9 +1397,10 @@ setupgpu(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 		},
-	}, NULL /* allocator */, &vertbuf);
+	}, NULL /* allocator */, &modelpipeline.vertbuf);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DESCRIPTOR_POOL);
+		cleanup_modelpipeline(PIPELINE);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
@@ -1465,9 +1416,10 @@ setupgpu(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 		},
-	}, NULL /* allocator */, &transbuf);
+	}, NULL /* allocator */, &modelpipeline.transbuf);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(VERTEX_BUFFER);
+		cleanup_modelpipeline(VERTEX_BUFFER);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
@@ -1482,16 +1434,17 @@ setupgpu(void)
 		.queueFamilyIndexCount = 1,
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
-		},
-	}, NULL /* allocator */, &modelbuf);
+			},
+	}, NULL /* allocator */, &modelpipeline.modelbuf);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(TRANSFORM_BUFFER);
+		cleanup_modelpipeline(TRANSFORM_BUFFER);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
 	/* TODO: all of this can overflow */
 	VkMemoryRequirements memreq;
-	vkGetBufferMemoryRequirements(device, vertbuf, &memreq);
+	vkGetBufferMemoryRequirements(device, modelpipeline.vertbuf, &memreq);
 	size_t align = memreq.alignment - 1;
 	meshsz = (sizeof(struct vertexinfo)*meshcnt + align) & ~align;
 	size_t transsz = (sizeof(mat4x4) * nobjs + align) & ~align;
@@ -1501,63 +1454,290 @@ setupgpu(void)
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext = NULL,
 		.allocationSize = allocsz,
-		.memoryTypeIndex = (uint32_t)memidx,
-	}, NULL /* allocator */, &memory);
+		.memoryTypeIndex = memidx,
+	}, NULL /* allocator */, &modelpipeline.memory);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(MODEL_BUFFER);
+		cleanup_modelpipeline(MODEL_BUFFER);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
 	}
 
 	res = vkBindBufferMemory2(device, 3, (VkBindBufferMemoryInfo[]){{
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = vertbuf,
-			.memory = memory,
+			.buffer = modelpipeline.vertbuf,
+			.memory = modelpipeline.memory,
 			.memoryOffset = 0,
 		}, {
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = transbuf,
-			.memory = memory,
+			.buffer = modelpipeline.transbuf,
+			.memory = modelpipeline.memory,
 			.memoryOffset = meshsz,
 		}, {
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = modelbuf,
-			.memory = memory,
+			.buffer = modelpipeline.modelbuf,
+			.memory = modelpipeline.memory,
 			.memoryOffset = meshsz + transsz,
 		},
 	});
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE_MEMORY);
+		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
 	}
 
 	/* TODO: investigate the consequences of this being one big mem block */
 	void *ptr;
-	res = vkMapMemory(device, memory, 0, meshsz, 0, &ptr); 
+	res = vkMapMemory(device, modelpipeline.memory, 0, meshsz, 0, &ptr); 
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE_MEMORY);
+		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
 	memcpy(ptr, meshes, sizeof(struct vertexinfo)*meshcnt);
-	vkUnmapMemory(device, memory);
+	vkUnmapMemory(device, modelpipeline.memory);
 
-	res = vkMapMemory(device, memory, meshsz, transsz+modelsz, 0,
-		(void **)&transforms);
+	res = vkMapMemory(device, modelpipeline.memory, meshsz, transsz+modelsz,
+		0, (void **)&transforms);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(DEVICE_MEMORY);
+		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
 	models = (mat4x4 *)((char *)transforms + transsz);
+}
 
+static void
+setup_renderer(void)
+{
+	VkResult res;
+
+	res = vkCreateDescriptorPool(device, &(VkDescriptorPoolCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.maxSets = 1,
+		.poolSizeCount = 2,
+		.pPoolSizes = (VkDescriptorPoolSize[]){ {
+				.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+				.descriptorCount = 1,
+			}, {
+				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+				.descriptorCount = 2,
+			},
+		},
+	}, NULL /* allocator */, &renderer.dpool);
+	if (res != VK_SUCCESS) {
+		cleanup_before(RENDERER);
+		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
+	}
+
+
+	res = vkCreateImage(device, &(VkImageCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.imageType = VK_IMAGE_TYPE_2D,
+		.format = VK_FORMAT_D32_SFLOAT,
+		.extent = {
+			.width = width,
+			.height = height,
+			.depth = 1,
+		},
+		.mipLevels = 1,
+		.arrayLayers = 1,
+		.samples = VK_SAMPLE_COUNT_1_BIT,
+		.tiling = VK_IMAGE_TILING_OPTIMAL,
+		.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]){ qfamidx },
+		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+	}, NULL /* allocator */, &renderer.modeldepth);
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(DESCRIPTOR_POOL);
+		cleanup_before(RENDERER);
+		errx(1, "couldn't create image for depth buffer: %s",
+			vkstrerror(res));
+	}
+
+	VkMemoryRequirements2 imreqs = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+		.pNext = NULL,
+	};
+	vkGetImageMemoryRequirements2(device, &(VkImageMemoryRequirementsInfo2){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+		.pNext = NULL,
+		.image = renderer.modeldepth,
+	}, &imreqs);
+	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = NULL,
+		/* TODO: align */
+		.allocationSize = imreqs.memoryRequirements.size,
+		.memoryTypeIndex = memidx,
+	}, NULL /* allocator */, &renderer.memory);
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(DEPTH_BUFFER);
+		cleanup_before(RENDERER);
+		errx(1, "couldn't allocate memory for depth buffer: %s",
+			vkstrerror(res));
+	}
+
+	res = vkBindImageMemory2(device, 1, (VkBindImageMemoryInfo[]){{
+			.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+			.pNext = NULL,
+			.image = renderer.modeldepth,
+			.memory = renderer.memory,
+			.memoryOffset = 0,
+		},
+	});
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(DEPTH_MEMORY);
+		cleanup_before(RENDERER);
+		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
+	}
+
+	res = vkCreateImageView(device, &(VkImageViewCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.image = renderer.modeldepth,
+		.viewType = VK_IMAGE_VIEW_TYPE_2D,
+		.format = VK_FORMAT_D32_SFLOAT,
+		.components = { 0, },
+		.subresourceRange = {
+			.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+			.baseMipLevel = 0,
+			.levelCount = 1,
+			.baseArrayLayer = 0,
+			.layerCount = 1,
+		}
+	}, NULL /* allocator */, &renderer.mdview);
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(DEPTH_MEMORY);
+		cleanup_before(RENDERER);
+		errx(1, "couldn't create image view for depth buffer: %s",
+			vkstrerror(res));
+	}
+
+	res = vkCreateRenderPass(device, &(VkRenderPassCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.attachmentCount = 2,
+		.pAttachments = (const VkAttachmentDescription[]){ {
+				.flags = 0,
+				.format = display.fmt.format,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+			}, {
+				.flags = 0,
+				.format = VK_FORMAT_D32_SFLOAT,
+				.samples = VK_SAMPLE_COUNT_1_BIT,
+				.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+				.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+				.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+				.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+				.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+			},
+		},
+		.subpassCount = 1,
+		.pSubpasses = &(VkSubpassDescription){
+			.flags = 0,
+			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+			.inputAttachmentCount = 0,
+			.pInputAttachments = NULL,
+			.colorAttachmentCount = 1,
+			.pColorAttachments = (VkAttachmentReference[]){ {
+					.attachment = 0,
+					.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+				},
+			 },
+			.pResolveAttachments = NULL,
+			.pDepthStencilAttachment = (VkAttachmentReference[]){ {
+					.attachment = 1,
+					.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				},
+			},
+			.preserveAttachmentCount = 0,
+			.pPreserveAttachments = NULL,
+		},
+		.dependencyCount = 1,
+		.pDependencies = (VkSubpassDependency[]){{
+				.srcSubpass = VK_SUBPASS_EXTERNAL,
+				.dstSubpass = 0,
+				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			},
+		},
+	}, NULL /* allocator */, &renderer.pass);
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(DEPTH_VIEW);
+		cleanup_before(RENDERER);
+		errx(1, "coudln't create render pass: %s", vkstrerror(res));
+	}
+
+	display.framebuffers = malloc(sizeof(VkFramebuffer) * display.nims);
+	if (display.framebuffers == NULL) {
+		cleanup_renderer(RENDER_PASS);
+		cleanup_before(RENDERER);
+		err(1, "couldn't not allocate for framebuffers");
+	}
+	display.nfbs = 0;
+	for (size_t i = 0; i < display.nims; i++) {
+		res = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.renderPass = renderer.pass,
+			.attachmentCount = 2,
+			.pAttachments = (VkImageView[]) {
+				display.views[i],
+				renderer.mdview,
+			},
+			.width = width,
+			.height = height,
+			.layers = 1,
+		}, NULL /* allocator */, display.framebuffers+i);
+		if (res != VK_SUCCESS) {
+			cleanup_renderer(FRAMEBUFFERS);
+			cleanup_before(RENDERER);
+			errx(1, "coudln't allocate frame buffer: %s",
+				vkstrerror(res));
+		}
+		display.nfbs++;
+	}
+
+	res = vkCreateCommandPool(device, &(VkCommandPoolCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+		.pNext = NULL,
+		.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+		.queueFamilyIndex = qfamidx,
+	}, NULL /* allocator */, &renderer.cpool);
+	if (res != VK_SUCCESS) {
+		cleanup_renderer(FRAMEBUFFERS);
+		cleanup_before(RENDERER);
+		errx(1, "couldn't allocate command pool: %s", vkstrerror(res));
+	}
 	res = vkCreateFence(device, &(VkFenceCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-	}, NULL /* allocator */, &fence);
+	}, NULL /* allocator */, &renderer.fence);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(UNMAP_TRANSFORMS);
+		cleanup_renderer(POOL);
+		cleanup_before(RENDERER);
 		errx(1, "couldn't create fence: %s", vkstrerror(res));
 	}
 
@@ -1565,31 +1745,25 @@ setupgpu(void)
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-	}, NULL /* allocator */, &acquiresem);
+	}, NULL /* allocator */, &renderer.acquiresem);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(FENCE);
+		cleanup_renderer(FENCE);
+		cleanup_before(RENDERER);
 		errx(1, "couldn't create semaphore: %s", vkstrerror(res));
 	}
 
 	res = vkAllocateCommandBuffers(device, &(VkCommandBufferAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
 		.pNext = NULL,
-		.commandPool = pool,
+		.commandPool = renderer.cpool,
 		.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
 		.commandBufferCount = 1,
-	}, &cmdbuf);
+	}, &renderer.cmdbuf);
 	if (res != VK_SUCCESS) {
-		cleanupgpu(ACQUIRE_SEMAPHORE);
+		cleanup_renderer(ACQUIRE_SEMAPHORE);
+		cleanup_before(RENDERER);
 		errx(1, "couldn't get a command buffer: %s", vkstrerror(res));
 	}
-}
-
-static void
-teardown(void)
-{
-	cleanupgpu(ALL);
-	glfwDestroyWindow(display.window);
-	glfwTerminate();
 }
 
 static void
@@ -1603,7 +1777,7 @@ render(void)
 		.pNext = NULL,
 		.swapchain = display.swapchain,
 		.timeout = 0,
-		.semaphore = acquiresem,
+		.semaphore = renderer.acquiresem,
 		.fence = VK_NULL_HANDLE,
 		.deviceMask = 1,
 	}, &idx);
@@ -1616,10 +1790,10 @@ render(void)
 	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
 		.pNext = NULL,
-		.descriptorPool = dpool,
+		.descriptorPool = renderer.dpool,
 		.descriptorSetCount = 1,
 		.pSetLayouts = (VkDescriptorSetLayout[]){
-			dsetlayout,
+			modelpipeline.dsetlayout,
 		}
 	}, &dset);
 	if (res != VK_SUCCESS) {
@@ -1627,13 +1801,13 @@ render(void)
 		return;
 	}
 
-	res = vkResetCommandBuffer(cmdbuf, 0);
+	res = vkResetCommandBuffer(renderer.cmdbuf, 0);
 	if (res != VK_SUCCESS) {
 		warnx("couldn't reset command buffer: %s", vkstrerror(res));
 		return;
 	}
 
-	res = vkBeginCommandBuffer(cmdbuf, &(VkCommandBufferBeginInfo){
+	res = vkBeginCommandBuffer(renderer.cmdbuf, &(VkCommandBufferBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.pNext = NULL,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
@@ -1673,11 +1847,11 @@ render(void)
 			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 			.pImageInfo = NULL,
 			.pBufferInfo = (VkDescriptorBufferInfo[]){{
-					.buffer = transbuf,
+					.buffer = modelpipeline.transbuf,
 					.offset = 0,
 					.range = VK_WHOLE_SIZE,
 				}, {
-					.buffer = modelbuf,
+					.buffer = modelpipeline.modelbuf,
 					.offset = 0,
 					.range = VK_WHOLE_SIZE,
 				},
@@ -1685,16 +1859,18 @@ render(void)
 			.pTexelBufferView = NULL,
 		},
 	}, 0, NULL);
-	vkCmdBindDescriptorSets(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
-		0, 1, &dset, 2, (uint32_t[]){ 0, 0 });
-	vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-	vkCmdBindVertexBuffers(cmdbuf, 0, 1,
-		(VkBuffer[]){ vertbuf },
+	vkCmdBindDescriptorSets(renderer.cmdbuf,
+		VK_PIPELINE_BIND_POINT_GRAPHICS, modelpipeline.layout, 0, 1,
+		&dset, 2, (uint32_t[]){ 0, 0 });
+	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		modelpipeline.pipeline);
+	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
+		(VkBuffer[]){ modelpipeline.vertbuf },
 		(VkDeviceSize[]){ 0 });
-	vkCmdBeginRenderPass(cmdbuf, &(VkRenderPassBeginInfo){
+	vkCmdBeginRenderPass(renderer.cmdbuf, &(VkRenderPassBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.pNext = NULL,
-		.renderPass = renderpass,
+		.renderPass = renderer.pass,
 		.framebuffer = display.framebuffers[idx],
 		.renderArea = {
 			.offset = { .x = (1-meshpct)*width, .y = 0 },
@@ -1709,11 +1885,11 @@ render(void)
 					.stencil = 0,
 				},
 			}
-		  },
+		},
 	}, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdDraw(cmdbuf, meshcnt, 1, 0, 0);
-	vkCmdEndRenderPass(cmdbuf);
-	vkEndCommandBuffer(cmdbuf);
+	vkCmdDraw(renderer.cmdbuf, meshcnt, 1, 0, 0);
+	vkCmdEndRenderPass(renderer.cmdbuf);
+	vkEndCommandBuffer(renderer.cmdbuf);
 
 	VkQueue queue;
 	vkGetDeviceQueue(device, qfamidx, 0, &queue);
@@ -1721,17 +1897,17 @@ render(void)
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		.pNext = NULL,
 		.waitSemaphoreCount = 1,
-		.pWaitSemaphores = (VkSemaphore[]){ acquiresem },
+		.pWaitSemaphores = (VkSemaphore[]){ renderer.acquiresem },
 		.pWaitDstStageMask = (VkPipelineStageFlags[]){
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		},
 		.commandBufferCount = 1,
 		.pCommandBuffers = (VkCommandBuffer[]){
-			cmdbuf,
+			renderer.cmdbuf,
 		},
 		.signalSemaphoreCount = 1,
 		.pSignalSemaphores = (VkSemaphore[]){ display.semaphores[idx] },
-	}, fence);
+	}, renderer.fence);
 	if (res != VK_SUCCESS)
 		warnx("couldn't submit work to queue: %s", vkstrerror(res));
 
@@ -1746,21 +1922,23 @@ render(void)
 		.pResults = NULL,
 	});
 
-	res = vkWaitForFences(
-		device, 1, (VkFence[]){ fence }, VK_TRUE, (uint64_t)-1);
+	res = vkWaitForFences(device, 1, (VkFence[]){ renderer.fence },
+		VK_TRUE, (uint64_t)-1);
 	if (res != VK_SUCCESS)
 		warnx("couldn't wait on fence");
-	vkResetFences(device, 1, (VkFence[]){ fence });
+	vkResetFences(device, 1, (VkFence[]){ renderer.fence });
 
 free_dset:
-	vkResetDescriptorPool(device, dpool, 0);
+	vkResetDescriptorPool(device, renderer.dpool, 0);
 }
 
 int
 main(void)
 {
-	setupcpu();
-	setupgpu();
+	setup_cpu();
+	setup_display();
+	setup_renderer();
+	setup_modelpipeline();
 	struct timespec prev = {0};
 	while (!glfwWindowShouldClose(display.window)) {
 		render();
@@ -1774,7 +1952,9 @@ main(void)
 		}
 		prev = curr;
 	}
-	teardown();
+	cleanup_before(END);
+	glfwDestroyWindow(display.window);
+	glfwTerminate();
 
 	return 0;
 }
