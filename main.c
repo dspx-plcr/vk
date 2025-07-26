@@ -18,6 +18,21 @@
 #define max(a, b) ((a) > (b) ? (a) : (b))
 #define PI ((double)3.14159265358979323846)
 
+static const char *progname = "My Little Vulkan App";
+static const float width = 1920;
+static const float height = 1080;
+static const float depth = 1000;
+static const float meshpct = 0.9;
+
+static const double panspeed = 0.2;
+static const double rotspeed = PI / (2 * width);
+static const double zoomspeed = 70;
+
+static VkInstance instance;
+static VkDevice device;
+static uint32_t qfamidx;
+static uint32_t memidx;
+
 static struct {
 	GLFWwindow *window;
 	VkSurfaceKHR surface;
@@ -35,46 +50,6 @@ static struct {
 	VkSurfaceFormatKHR fmt;
 	VkPresentModeKHR mode;
 } display;
-
-static struct {
-	VkDescriptorSetLayout dsetlayout;
-	VkPipelineLayout layout;
-	VkPipeline pipeline;
-	VkShaderModule vertshader;
-	VkShaderModule fragshader;
-	VkDeviceMemory memory;
-	VkBuffer vertbuf;
-	VkBuffer transbuf;
-	VkBuffer modelbuf;
-} modelpipeline;
-
-static struct {
-	VkRenderPass pass;
-	VkDescriptorPool dpool;
-	VkCommandPool cpool;
-	VkFence fence;
-	VkSemaphore acquiresem;
-	VkCommandBuffer cmdbuf;
-	VkDeviceMemory memory;
-
-	VkImage modeldepth;
-	VkImageView mdview;
-} renderer;
-
-static const char *progname = "My Little Vulkan App";
-static const float width = 1920;
-static const float height = 1080;
-static const float depth = 1000;
-static const float meshpct = 0.9;
-
-static const double panspeed = 0.2;
-static const double rotspeed = PI / (2 * width);
-static const double zoomspeed = 70;
-
-static VkInstance instance;
-static VkDevice device;
-static uint32_t qfamidx;
-static uint32_t memidx;
 
 struct boundingbox {
 	vec3 offset;
@@ -97,21 +72,55 @@ struct vertexinfo {
 	vec3 norm;
 };
 
-static size_t nobjs;
-static struct object *objs;
-static struct vertexinfo *meshes;
-static size_t meshcnt;
-static size_t meshsz;
-static struct bounds *bounds;
-static vec3 camera;
-static vec3 target;
-static vec3 up;
-static mat4x4 *transforms;
-static mat4x4 *models;
+static struct {
+	VkDescriptorSetLayout dsetlayout;
+	VkPipelineLayout layout;
+	VkPipeline pipeline;
+	VkShaderModule vertshader;
+	VkShaderModule fragshader;
+	VkDeviceMemory memory;
+	VkBuffer vertbuf;
+	VkBuffer transbuf;
+	VkBuffer modelbuf;
 
-static vec2 lastmouse;
-static bool panning;
-static bool rotating;
+	size_t nobjs;
+	struct object *objs;
+	struct vertexinfo *meshes;
+	size_t meshcnt;
+	size_t meshsz;
+	struct bounds *bounds;
+	vec3 camera;
+	vec3 target;
+	vec3 up;
+	mat4x4 *transforms;
+	mat4x4 *models;
+
+	vec2 lastmouse;
+	bool panning;
+	bool rotating;
+} model;
+
+static struct {
+	VkDescriptorSetLayout dsetlayout;
+	VkPipelineLayout layout;
+	VkPipeline pipeline;
+	VkShaderModule vertshader;
+	VkShaderModule fragshader;
+	VkDeviceMemory memory;
+} ui;
+
+static struct {
+	VkRenderPass pass;
+	VkDescriptorPool dpool;
+	VkCommandPool cpool;
+	VkFence fence;
+	VkSemaphore acquiresem;
+	VkCommandBuffer cmdbuf;
+	VkDeviceMemory memory;
+
+	VkImage modeldepth;
+	VkImageView mdview;
+} renderer;
 
 static int64_t
 nanotimerdiff(struct timespec a, struct timespec b)
@@ -122,15 +131,15 @@ nanotimerdiff(struct timespec a, struct timespec b)
 static void
 reset_camera(void)
 {
-	target[0] = 0;
-	target[1] = 0;
-	target[2] = 0;
-	up[0] = 0;
-	up[1] = -1;
-	up[2] = 0;
-	camera[0] = 0;
-	camera[1] = height/4;
-	camera[2] = depth/2;
+	model.target[0] = 0;
+	model.target[1] = 0;
+	model.target[2] = 0;
+	model.up[0] = 0;
+	model.up[1] = -1;
+	model.up[2] = 0;
+	model.camera[0] = 0;
+	model.camera[1] = height/4;
+	model.camera[2] = depth/2;
 }
 
 static const char *
@@ -283,7 +292,7 @@ cleanup_display(enum displaystage stage)
 	}
 }
 
-enum modelpipelinestage {
+enum modelstage {
 	DESCRIPTOR_SET_LAYOUT,
 	LAYOUT,
 	VERT_SHADER,
@@ -299,39 +308,34 @@ enum modelpipelinestage {
 };
 
 static void
-cleanup_modelpipeline(enum modelpipelinestage stage)
+cleanup_model(enum modelstage stage)
 {
 	switch (stage) {
 	case MODEL_PIPELINE_ALL:
 	case UNMAP_TRANSFORMS:
-		vkUnmapMemory(device, modelpipeline.memory);
+		vkUnmapMemory(device, model.memory);
 	case DEVICE_MEMORY:
-		vkFreeMemory(device, modelpipeline.memory,
-			NULL /* allocator */);
+		vkFreeMemory(device, model.memory, NULL /* allocator */);
 	case MODEL_BUFFER:
-		vkDestroyBuffer(device, modelpipeline.modelbuf,
-			NULL /* allocator */);
+		vkDestroyBuffer(device, model.modelbuf, NULL /* allocator */);
 	case TRANSFORM_BUFFER:
-		vkDestroyBuffer(device, modelpipeline.transbuf,
-			NULL /* allocator */);
+		vkDestroyBuffer(device, model.transbuf, NULL /* allocator */);
 	case VERTEX_BUFFER:
-		vkDestroyBuffer(device, modelpipeline.vertbuf,
-			NULL /* allocator */);
+		vkDestroyBuffer(device, model.vertbuf, NULL /* allocator */);
 	case PIPELINE:
-		vkDestroyPipeline(device, modelpipeline.pipeline,
-			NULL /* allocator */);
+		vkDestroyPipeline(device, model.pipeline, NULL /* allocator */);
 	case SHADERS:
 	case FRAG_SHADER:
-		vkDestroyShaderModule(device, modelpipeline.fragshader,
+		vkDestroyShaderModule(device, model.fragshader,
 			NULL /* allocator */);
 	case VERT_SHADER:
-		vkDestroyShaderModule(device, modelpipeline.vertshader,
+		vkDestroyShaderModule(device, model.vertshader,
 			NULL /* allocator */);
 	case LAYOUT:
-		vkDestroyPipelineLayout(device, modelpipeline.layout,
+		vkDestroyPipelineLayout(device, model.layout,
 			NULL /* allocator */);
 	case DESCRIPTOR_SET_LAYOUT:
-		vkDestroyDescriptorSetLayout(device, modelpipeline.dsetlayout,
+		vkDestroyDescriptorSetLayout(device, model.dsetlayout,
 			NULL /* allocator */);
 	}
 }
@@ -404,7 +408,7 @@ cleanup_before(enum gpustage stage)
 		vkGetDeviceQueue(device, qfamidx, 0, &queue);
 		vkQueueWaitIdle(queue);
 		vkDeviceWaitIdle(device);
-		cleanup_modelpipeline(MODEL_PIPELINE_ALL);
+		cleanup_model(MODEL_PIPELINE_ALL);
 	case MODEL_PIPELINE:
 		cleanup_renderer(RENDERER_ALL);
 	case RENDERER:
@@ -415,35 +419,35 @@ cleanup_before(enum gpustage stage)
 }
 
 static VkShaderModule
-read_shader(const char *filename, enum modelpipelinestage toclean)
+read_shader(const char *filename, enum modelstage toclean)
 {
 	FILE *f = fopen(filename, "rb");
 	if (f == NULL) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't open shader file for reading");
 	}
 	if (fseek(f, 0, SEEK_END) < 0) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't seek to end of shader file");
 	}
 	size_t codesz = ftell(f);
 	if (fseek(f, 0, SEEK_SET) < 0) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't seek to start of shader file");
 	}
 	uint32_t *code = malloc(codesz);
 	if (code == NULL) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		err(1, "couldn't allocate for shader code");
 	}
 	/* TODO: is endianness an issue here? */
 	size_t num = fread(code, 1, codesz, f);
 	if (num != codesz) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		if (ferror(f))
 			err(1, "couldn't read shader code into buffer");
@@ -460,7 +464,7 @@ read_shader(const char *filename, enum modelpipelinestage toclean)
 		.pCode = code,
 	}, NULL /* allocator */, &shader);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(toclean);
+		cleanup_model(toclean);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create shader module: %s", vkstrerror(res));
 	}
@@ -486,23 +490,23 @@ mousecb(GLFWwindow *win, int button, int action, int mods)
 	switch (button) {
 	case GLFW_MOUSE_BUTTON_LEFT:
 		if (action == GLFW_RELEASE) {
-			panning = false;
-			rotating = false;
+			model.panning = false;
+			model.rotating = false;
 		}
 
 		if ((action == GLFW_PRESS) && (mods & GLFW_MOD_SHIFT)) {
 			double x, y;
 			glfwGetCursorPos(win, &x, &y);
-			lastmouse[0] = x;
-			lastmouse[1] = y;
-			panning = true;
+			model.lastmouse[0] = x;
+			model.lastmouse[1] = y;
+			model.panning = true;
 		}
 		if ((action == GLFW_PRESS) && (mods & GLFW_MOD_CONTROL)) {
 			double x, y;
 			glfwGetCursorPos(win, &x, &y);
-			lastmouse[0] = x;
-			lastmouse[1] = y;
-			rotating = true;
+			model.lastmouse[0] = x;
+			model.lastmouse[1] = y;
+			model.rotating = true;
 		}
 		break;
 	}
@@ -542,26 +546,26 @@ scrollcb(GLFWwindow *win, double x, double y)
 	(void)win;
 	(void)x;
 	vec3 shifted, shiftedP;
-	vec3_sub(shifted, camera, target);
+	vec3_sub(shifted, model.camera, model.target);
 	cart2sph(shiftedP, shifted);
 	shiftedP[0] += y < 0 ? zoomspeed : -zoomspeed;
 	sph2cart(shifted, shiftedP);
-	vec3_add(camera, target, shifted);
+	vec3_add(model.camera, model.target, shifted);
 }
 
 static void
 cursorcb(GLFWwindow *win, double x, double y)
 {
 	(void)win;
-	if (panning) {
+	if (model.panning) {
 		vec2 dpos;
-		vec2_sub(dpos, lastmouse, (vec2){ x, y });
-		lastmouse[0] = x;
-		lastmouse[1] = y;
+		vec2_sub(dpos, model.lastmouse, (vec2){ x, y });
+		model.lastmouse[0] = x;
+		model.lastmouse[1] = y;
 
 		vec3 f, u, r;
-		vec3_sub(f, target, camera);
-		vec3_mul_cross(u, f, up);
+		vec3_sub(f, model.target, model.camera);
+		vec3_mul_cross(u, f, model.up);
 		vec3_mul_cross(r, f, u);
 		vec3_norm(u, u);
 		vec3_norm(r, r);
@@ -571,37 +575,37 @@ cursorcb(GLFWwindow *win, double x, double y)
 		vec3 diff = { 0, };
 		vec3_add(diff, diff, u);
 		vec3_add(diff, diff, r);
-		vec3_add(camera, camera, diff);
-		vec3_add(target, target, diff);
+		vec3_add(model.camera, model.camera, diff);
+		vec3_add(model.target, model.target, diff);
 	}
 
-	if (rotating) {
+	if (model.rotating) {
 		vec2 dpos;
-		vec2_sub(dpos, lastmouse, (vec2){ x, y });
-		lastmouse[0] = x;
-		lastmouse[1] = y;
+		vec2_sub(dpos, model.lastmouse, (vec2){ x, y });
+		model.lastmouse[0] = x;
+		model.lastmouse[1] = y;
 
 		/* TODO: Fix the discontinuities */
 		vec3 shifted, shiftedP;
-		vec3_sub(shifted, camera, target);
+		vec3_sub(shifted, model.camera, model.target);
 		cart2sph(shiftedP, shifted);
-		shiftedP[1] += up[1] * rotspeed * dpos[0];
-		shiftedP[2] += up[1] * rotspeed * dpos[1];
+		shiftedP[1] += model.up[1] * rotspeed * dpos[0];
+		shiftedP[2] += model.up[1] * rotspeed * dpos[1];
 		if (shiftedP[2] < -PI/2) {
 			shiftedP[1] += PI;
 			shiftedP[2] = -PI/2 + (-PI/2 - shiftedP[2]);
-			up[1] *= -1;
+			model.up[1] *= -1;
 		} else if (shiftedP[2] > PI/2) {
 			shiftedP[1] += PI;
 			shiftedP[2] = PI/2 - (shiftedP[2] - PI/2);
-			up[1] *= -1;
+			model.up[1] *= -1;
 		}
 		if (shiftedP[1] < 0)
 			shiftedP[1] += 2*PI;
 		else if (shiftedP[1] > 2*PI)
 			shiftedP[1] -= 2*PI;
 		sph2cart(shifted, shiftedP);
-		vec3_add(camera, target, shifted);
+		vec3_add(model.camera, model.target, shifted);
 	}
 }
 
@@ -626,34 +630,34 @@ setup_cpu(void)
 		"teapot.norm",
 	};
 
-	nobjs = ARR_SZ(files);
-	objs = malloc(sizeof(struct object) * nobjs);
-	if (objs == NULL) err(1, "couldn't allocate objects");
-	bounds = malloc(sizeof(struct bounds) * nobjs);
-	if (bounds == NULL) err(1, "couldn't allocate bounding boxes");
+	model.nobjs = ARR_SZ(files);
+	model.objs = malloc(sizeof(struct object) * model.nobjs);
+	if (model.objs == NULL) err(1, "couldn't allocate objects");
+	model.bounds = malloc(sizeof(struct bounds) * model.nobjs);
+	if (model.bounds == NULL) err(1, "couldn't allocate bounding boxes");
 
 	FILE *fs[ARR_SZ(files)];
 	for (size_t i = 0; i < ARR_SZ(fs); i++) {
 		fs[i] = fopen(files[i], "r");
 		if (fs[i] == NULL)
 			err(1, "couldn't open %s for reading", files[i]);
-		if (fscanf(fs[i], "%zu\n", &objs[i].nprims) == EOF)
+		if (fscanf(fs[i], "%zu\n", &model.objs[i].nprims) == EOF)
 			err(1, "couldn't read nprims form %s", files[i]);
-		objs[i].meshidx = meshcnt;
-		meshcnt += 3*objs[i].nprims;
+		model.objs[i].meshidx = model.meshcnt;
+		model.meshcnt += 3*model.objs[i].nprims;
 		/* TODO: alignment is determined by the GPU */
 	}
 
-	meshes = malloc(sizeof(struct vertexinfo) * meshcnt);
-	if (meshes == NULL) err(1, "couldn't allocate meshes");
+	model.meshes = malloc(sizeof(struct vertexinfo) * model.meshcnt);
+	if (model.meshes == NULL) err(1, "couldn't allocate meshes");
 	for (size_t i = 0; i < ARR_SZ(fs); i++) {
-		struct vertexinfo *vi = meshes + objs[i].meshidx;
+		struct vertexinfo *vi = model.meshes + model.objs[i].meshidx;
 		struct boundingbox b = {
 			.offset = { 0, 0, 0 },
 			.extent = { -1, -1, -1 },
 			.dir = { 1.0, 0.0, 0.0 },
 		};
-		for (size_t j = 0; j < objs[i].nprims; j++) {
+		for (size_t j = 0; j < model.objs[i].nprims; j++) {
 			for (size_t k = 0; k < 3; k++) {
 				float *vert = (float *)(vi + 3*j + k);
 				int res = fscanf(fs[i], "%f %f %f\n%f %f %f\n",
@@ -680,9 +684,9 @@ setup_cpu(void)
 		}
 		fclose(fs[i]);
 
-		bounds[i].orig = b;
-		vec4_scale(bounds[i].curr.offset, b.extent, -20);
-		vec4_scale(bounds[i].curr.extent, b.extent, 40);
+		model.bounds[i].orig = b;
+		vec4_scale(model.bounds[i].curr.offset, b.extent, -20);
+		vec4_scale(model.bounds[i].curr.extent, b.extent, 40);
 	}
 
 	reset_camera();
@@ -1171,7 +1175,7 @@ setup_display(void)
 }
 
 static void
-setup_modelpipeline(void)
+setup_model(void)
 {
 	VkResult res;
 
@@ -1194,7 +1198,7 @@ setup_modelpipeline(void)
 				.pImmutableSamplers = NULL,
 			},
 		},
-	}, NULL /* allocator */, &modelpipeline.dsetlayout);
+	}, NULL /* allocator */, &model.dsetlayout);
 	if (res != VK_SUCCESS) {
 		cleanup_renderer(RENDERER_ALL);
 		cleanup_before(RENDERER);
@@ -1208,19 +1212,19 @@ setup_modelpipeline(void)
 		.flags = 0,
 		.setLayoutCount = 1,
 		.pSetLayouts = (VkDescriptorSetLayout[]){
-			modelpipeline.dsetlayout,
+			model.dsetlayout,
 		},
 		.pushConstantRangeCount = 0,
 		.pPushConstantRanges = NULL,
-	}, NULL /* allocator */, &modelpipeline.layout);
+	}, NULL /* allocator */, &model.layout);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(DESCRIPTOR_SET_LAYOUT);
+		cleanup_model(DESCRIPTOR_SET_LAYOUT);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
 	}
 
-	modelpipeline.vertshader = read_shader("vert.spv", LAYOUT);
-	modelpipeline.fragshader = read_shader("frag.spv", VERT_SHADER);
+	model.vertshader = read_shader("vert.spv", LAYOUT);
+	model.fragshader = read_shader("frag.spv", VERT_SHADER);
 
 	res = vkCreateGraphicsPipelines(device, NULL /* cache */, 1,
 			&(VkGraphicsPipelineCreateInfo){
@@ -1233,7 +1237,7 @@ setup_modelpipeline(void)
 				.pNext = NULL,
 				.flags = 0,
 				.stage = VK_SHADER_STAGE_VERTEX_BIT,
-				.module = modelpipeline.vertshader,
+				.module = model.vertshader,
 				.pName = "main",
 				.pSpecializationInfo = NULL,
 			}, {
@@ -1241,7 +1245,7 @@ setup_modelpipeline(void)
 			 	.pNext = NULL,
 			 	.flags = 0,
 			 	.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-			 	.module = modelpipeline.fragshader,
+			 	.module = model.fragshader,
 			 	.pName = "main",
 			 	.pSpecializationInfo = NULL,
 			},
@@ -1371,14 +1375,14 @@ setup_modelpipeline(void)
 			.blendConstants = { 0, 0, 0, 0 },
 		},
 		.pDynamicState = NULL,
-		.layout = modelpipeline.layout,
+		.layout = model.layout,
 		.renderPass = renderer.pass,
 		.subpass = 0,
 		.basePipelineHandle = 0,
 		.basePipelineIndex = 0,
-	}, NULL /* allocator */, &modelpipeline.pipeline);
+	}, NULL /* allocator */, &model.pipeline);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(SHADERS);
+		cleanup_model(SHADERS);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create graphics pipeline: %s",
 			vkstrerror(res));
@@ -1389,7 +1393,7 @@ setup_modelpipeline(void)
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.size = sizeof(struct vertexinfo) * meshcnt,
+		.size = sizeof(struct vertexinfo) * model.meshcnt,
 		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1397,9 +1401,9 @@ setup_modelpipeline(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 		},
-	}, NULL /* allocator */, &modelpipeline.vertbuf);
+	}, NULL /* allocator */, &model.vertbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(PIPELINE);
+		cleanup_model(PIPELINE);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
@@ -1408,7 +1412,7 @@ setup_modelpipeline(void)
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.size = sizeof(mat4x4) * nobjs,
+		.size = sizeof(mat4x4) * model.nobjs,
 		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1416,9 +1420,9 @@ setup_modelpipeline(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 		},
-	}, NULL /* allocator */, &modelpipeline.transbuf);
+	}, NULL /* allocator */, &model.transbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(VERTEX_BUFFER);
+		cleanup_model(VERTEX_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
@@ -1427,7 +1431,7 @@ setup_modelpipeline(void)
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.size = sizeof(mat4x4) * nobjs,
+		.size = sizeof(mat4x4) * model.nobjs,
 		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 			VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1435,29 +1439,30 @@ setup_modelpipeline(void)
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
 			},
-	}, NULL /* allocator */, &modelpipeline.modelbuf);
+	}, NULL /* allocator */, &model.modelbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(TRANSFORM_BUFFER);
+		cleanup_model(TRANSFORM_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
 	/* TODO: all of this can overflow */
 	VkMemoryRequirements memreq;
-	vkGetBufferMemoryRequirements(device, modelpipeline.vertbuf, &memreq);
+	vkGetBufferMemoryRequirements(device, model.vertbuf, &memreq);
 	size_t align = memreq.alignment - 1;
-	meshsz = (sizeof(struct vertexinfo)*meshcnt + align) & ~align;
-	size_t transsz = (sizeof(mat4x4) * nobjs + align) & ~align;
-	size_t modelsz = (sizeof(mat4x4) * nobjs + align) & ~align;
-	size_t allocsz = max(memreq.size, meshsz + transsz + modelsz);
+	model.meshsz =
+		(sizeof(struct vertexinfo) * model.meshcnt + align) & ~align;
+	size_t transsz = (sizeof(mat4x4) * model.nobjs + align) & ~align;
+	size_t modelsz = (sizeof(mat4x4) * model.nobjs + align) & ~align;
+	size_t allocsz = max(memreq.size, model.meshsz + transsz + modelsz);
 	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
 		.pNext = NULL,
 		.allocationSize = allocsz,
 		.memoryTypeIndex = memidx,
-	}, NULL /* allocator */, &modelpipeline.memory);
+	}, NULL /* allocator */, &model.memory);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(MODEL_BUFFER);
+		cleanup_model(MODEL_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
 	}
@@ -1465,48 +1470,53 @@ setup_modelpipeline(void)
 	res = vkBindBufferMemory2(device, 3, (VkBindBufferMemoryInfo[]){{
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = modelpipeline.vertbuf,
-			.memory = modelpipeline.memory,
+			.buffer = model.vertbuf,
+			.memory = model.memory,
 			.memoryOffset = 0,
 		}, {
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = modelpipeline.transbuf,
-			.memory = modelpipeline.memory,
-			.memoryOffset = meshsz,
+			.buffer = model.transbuf,
+			.memory = model.memory,
+			.memoryOffset = model.meshsz,
 		}, {
 			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
 			.pNext = NULL,
-			.buffer = modelpipeline.modelbuf,
-			.memory = modelpipeline.memory,
-			.memoryOffset = meshsz + transsz,
+			.buffer = model.modelbuf,
+			.memory = model.memory,
+			.memoryOffset = model.meshsz + transsz,
 		},
 	});
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_model(DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
 	}
 
 	/* TODO: investigate the consequences of this being one big mem block */
 	void *ptr;
-	res = vkMapMemory(device, modelpipeline.memory, 0, meshsz, 0, &ptr); 
+	res = vkMapMemory(device, model.memory, 0, model.meshsz, 0, &ptr); 
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_model(DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
-	memcpy(ptr, meshes, sizeof(struct vertexinfo)*meshcnt);
-	vkUnmapMemory(device, modelpipeline.memory);
+	memcpy(ptr, model.meshes, sizeof(struct vertexinfo)*model.meshcnt);
+	vkUnmapMemory(device, model.memory);
 
-	res = vkMapMemory(device, modelpipeline.memory, meshsz, transsz+modelsz,
-		0, (void **)&transforms);
+	res = vkMapMemory(device, model.memory, model.meshsz, transsz+modelsz,
+		0, (void **)&model.transforms);
 	if (res != VK_SUCCESS) {
-		cleanup_modelpipeline(DEVICE_MEMORY);
+		cleanup_model(DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
-	models = (mat4x4 *)((char *)transforms + transsz);
+	model.models = (mat4x4 *)((char *)model.transforms + transsz);
+}
+
+static void
+setup_ui(void)
+{
 }
 
 static void
@@ -1767,6 +1777,83 @@ setup_renderer(void)
 }
 
 static void
+render_model(void)
+{
+	VkResult res;
+
+	VkDescriptorSet dset;
+	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.pNext = NULL,
+		.descriptorPool = renderer.dpool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = (VkDescriptorSetLayout[]){
+			model.dsetlayout,
+		}
+	}, &dset);
+	if (res != VK_SUCCESS) {
+		warnx("couldn't get a descriptor set: %s", vkstrerror(res));
+		return;
+	}
+
+	for (size_t i = 0; i < model.nobjs; i++) {
+		mat4x4 A, M, V, P;
+
+		const float *off = model.bounds[i].orig.offset;
+		const float *box = model.bounds[i].curr.extent;
+		const float *ogbox = model.bounds[i].orig.extent;
+		mat4x4_identity(A);
+		mat4x4_scale_aniso(M, A,
+			box[0] / ogbox[0],
+			box[1] / ogbox[1],
+			box[2] / ogbox[2]);
+		mat4x4_translate(A, off[0], off[1], off[2]);
+		mat4x4_mul(M, A, M);
+		mat4x4_look_at(V, model.camera, model.target, model.up);
+		mat4x4_perspective(P, 120, width/height, -1, 1);
+		mat4x4_mul(A, V, M);
+		mat4x4_mul(model.transforms[i], P, A);
+		mat4x4_dup(model.models[i], M);
+	}
+	vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
+			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+			.pNext = NULL,
+			.dstSet = dset,
+			.dstBinding = 0,
+			.dstArrayElement = 0,
+			.descriptorCount = 2,
+			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+			.pImageInfo = NULL,
+			.pBufferInfo = (VkDescriptorBufferInfo[]){{
+					.buffer = model.transbuf,
+					.offset = 0,
+					.range = VK_WHOLE_SIZE,
+				}, {
+					.buffer = model.modelbuf,
+					.offset = 0,
+					.range = VK_WHOLE_SIZE,
+				},
+			},
+			.pTexelBufferView = NULL,
+		},
+	}, 0, NULL);
+	vkCmdBindDescriptorSets(renderer.cmdbuf,
+		VK_PIPELINE_BIND_POINT_GRAPHICS, model.layout, 0, 1,
+		&dset, 2, (uint32_t[]){ 0, 0 });
+	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		model.pipeline);
+	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
+		(VkBuffer[]){ model.vertbuf },
+		(VkDeviceSize[]){ 0 });
+	vkCmdDraw(renderer.cmdbuf, model.meshcnt, 1, 0, 0);
+}
+
+static void
+render_ui(void)
+{
+}
+
+static void
 render(void)
 {
 	VkResult res;
@@ -1783,21 +1870,6 @@ render(void)
 	}, &idx);
 	if (res != VK_SUCCESS) {
 		warnx("couldn't acquire image for presentation");
-		return;
-	}
-
-	VkDescriptorSet dset;
-	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.pNext = NULL,
-		.descriptorPool = renderer.dpool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = (VkDescriptorSetLayout[]){
-			modelpipeline.dsetlayout,
-		}
-	}, &dset);
-	if (res != VK_SUCCESS) {
-		warnx("couldn't get a descriptor set: %s", vkstrerror(res));
 		return;
 	}
 
@@ -1818,55 +1890,6 @@ render(void)
 		goto free_dset;
 	}
 
-	for (size_t i = 0; i < nobjs; i++) {
-		mat4x4 A, model, view, proj;
-
-		const float *off = bounds[i].orig.offset;
-		const float *box = bounds[i].curr.extent;
-		const float *ogbox = bounds[i].orig.extent;
-		mat4x4_identity(A);
-		mat4x4_scale_aniso(model, A,
-			box[0] / ogbox[0],
-			box[1] / ogbox[1],
-			box[2] / ogbox[2]);
-		mat4x4_translate(A, off[0], off[1], off[2]);
-		mat4x4_mul(model, A, model);
-		mat4x4_look_at(view, camera, target, up);
-		mat4x4_perspective(proj, 120, width/height, -1, 1);
-		mat4x4_mul(A, view, model);
-		mat4x4_mul(transforms[i], proj, A);
-		mat4x4_dup(models[i], model);
-	}
-	vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
-			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-			.pNext = NULL,
-			.dstSet = dset,
-			.dstBinding = 0,
-			.dstArrayElement = 0,
-			.descriptorCount = 2,
-			.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
-			.pImageInfo = NULL,
-			.pBufferInfo = (VkDescriptorBufferInfo[]){{
-					.buffer = modelpipeline.transbuf,
-					.offset = 0,
-					.range = VK_WHOLE_SIZE,
-				}, {
-					.buffer = modelpipeline.modelbuf,
-					.offset = 0,
-					.range = VK_WHOLE_SIZE,
-				},
-			},
-			.pTexelBufferView = NULL,
-		},
-	}, 0, NULL);
-	vkCmdBindDescriptorSets(renderer.cmdbuf,
-		VK_PIPELINE_BIND_POINT_GRAPHICS, modelpipeline.layout, 0, 1,
-		&dset, 2, (uint32_t[]){ 0, 0 });
-	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-		modelpipeline.pipeline);
-	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
-		(VkBuffer[]){ modelpipeline.vertbuf },
-		(VkDeviceSize[]){ 0 });
 	vkCmdBeginRenderPass(renderer.cmdbuf, &(VkRenderPassBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.pNext = NULL,
@@ -1887,7 +1910,8 @@ render(void)
 			}
 		},
 	}, VK_SUBPASS_CONTENTS_INLINE);
-	vkCmdDraw(renderer.cmdbuf, meshcnt, 1, 0, 0);
+	render_model();
+	render_ui();
 	vkCmdEndRenderPass(renderer.cmdbuf);
 	vkEndCommandBuffer(renderer.cmdbuf);
 
@@ -1938,7 +1962,8 @@ main(void)
 	setup_cpu();
 	setup_display();
 	setup_renderer();
-	setup_modelpipeline();
+	setup_model();
+	setup_ui();
 	struct timespec prev = {0};
 	while (!glfwWindowShouldClose(display.window)) {
 		render();
