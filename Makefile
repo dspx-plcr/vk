@@ -7,8 +7,10 @@ TARGET = vk
 OBJS = \
 	main.o
 SHADERS = \
-	vert.spv \
-	frag.spv
+	vert.model.spv \
+	frag.model.spv \
+	vert.ui.spv \
+	frag.ui.spv
 
 $(TARGET): $(OBJS) $(SHADERS)
 	cc -o $@ $(LDFLAGS) $(OBJS)
@@ -18,7 +20,8 @@ main.c: linmath.h
 	cc -c $(CFLAGS) $^
 
 .glsl.spv:
-	glslc -o $@ -fshader-stage=$$(basename -s .glsl $^) $^
+	glslc -o $@ \
+		-fshader-stage=$$(echo $^ | sed -e 's/.\(model\|ui\).glsl//') $^
 
 clean:
 	rm -rf $(OBJS) $(TARGET) $(SHADERS)

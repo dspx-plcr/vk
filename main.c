@@ -1,4 +1,5 @@
 #include <err.h>
+#include <errno.h>
 #include <inttypes.h>
 #include <math.h>
 #include <stdbool.h>
@@ -12,6 +13,9 @@
 #include <GLFW/glfw3.h>
 
 #include "linmath.h"
+#define STBI_ONLY_TGA
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 #define ARR_SZ(a) (sizeof(a) / sizeof((a)[0]))
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -67,13 +71,14 @@ struct object {
 	size_t meshidx;
 };
 
-struct vertexinfo {
+struct modelvertex {
 	vec3 pos;
 	vec3 norm;
 };
 
 static struct {
 	VkDescriptorSetLayout dsetlayout;
+	VkDescriptorSet dset;
 	VkPipelineLayout layout;
 	VkPipeline pipeline;
 	VkShaderModule vertshader;
@@ -85,7 +90,7 @@ static struct {
 
 	size_t nobjs;
 	struct object *objs;
-	struct vertexinfo *meshes;
+	struct modelvertex *meshes;
 	size_t meshcnt;
 	size_t meshsz;
 	struct bounds *bounds;
@@ -100,13 +105,39 @@ static struct {
 	bool rotating;
 } model;
 
+struct uivertex {
+	vec2 pos;
+};
+
 static struct {
 	VkDescriptorSetLayout dsetlayout;
+	VkDescriptorSet *dsets;
 	VkPipelineLayout layout;
 	VkPipeline pipeline;
 	VkShaderModule vertshader;
 	VkShaderModule fragshader;
-	VkDeviceMemory memory;
+	VkDeviceMemory bufmem;
+	VkBuffer vertbuf;
+	VkBuffer idxbuf;
+	VkBuffer iconbuf;
+	VkDeviceMemory immem;
+	size_t *iconoff;
+	VkImage *iconims;
+	size_t niconims;
+	VkBindImageMemoryInfo *imbinds;
+	VkImageView *icons;
+	size_t niconviews;
+	VkSampler sampler;
+
+	size_t nverts;
+	struct uivertex *verts;
+	size_t nidxs;
+	uint32_t *idxs;
+	size_t nicons;
+	unsigned char *texels;
+	size_t texelsz;
+	size_t *texoff;
+	vec2 *boxes;
 } ui;
 
 static struct {
@@ -118,14 +149,26 @@ static struct {
 	VkCommandBuffer cmdbuf;
 	VkDeviceMemory memory;
 
-	VkImage modeldepth;
-	VkImageView mdview;
+	VkImage depthim;
+	VkImageView depth;
 } renderer;
 
 static int64_t
 nanotimerdiff(struct timespec a, struct timespec b)
 {
 	return 1e9*(a.tv_sec-b.tv_sec) + (a.tv_nsec-b.tv_nsec);
+}
+
+static void *
+nmalloc(size_t size, size_t n)
+{
+	if (SIZE_MAX / size < n) {
+		errno = EINVAL;
+		return NULL;
+	}
+
+	void *res = malloc(size * n);
+	return res;
 }
 
 static void
@@ -196,7 +239,7 @@ usabledev(
 		return false;
 	}
 	VkQueueFamilyProperties2 *qprops =
-		malloc(sizeof(VkQueueFamilyProperties2) * qcnt);
+		nmalloc(sizeof(VkQueueFamilyProperties2), qcnt);
 	if (qprops == NULL)
 		err(1, "couldn't allocate for queue family properties");
 	for (size_t i = 0; i < qcnt; i++)
@@ -293,17 +336,17 @@ cleanup_display(enum displaystage stage)
 }
 
 enum modelstage {
-	DESCRIPTOR_SET_LAYOUT,
-	LAYOUT,
-	VERT_SHADER,
-	FRAG_SHADER,
-	SHADERS,
-	PIPELINE,
-	VERTEX_BUFFER,
-	TRANSFORM_BUFFER,
-	MODEL_BUFFER,
-	DEVICE_MEMORY,
-	UNMAP_TRANSFORMS,
+	MP_DESCRIPTOR_SET_LAYOUT,
+	MP_LAYOUT,
+	MP_VERT_SHADER,
+	MP_FRAG_SHADER,
+	MP_SHADERS,
+	MP_PIPELINE,
+	MP_VERTEX_BUFFER,
+	MP_TRANSFORM_BUFFER,
+	MP_MODEL_BUFFER,
+	MP_DEVICE_MEMORY,
+	MP_UNMAP_TRANSFORMS,
 	MODEL_PIPELINE_ALL,
 };
 
@@ -312,30 +355,94 @@ cleanup_model(enum modelstage stage)
 {
 	switch (stage) {
 	case MODEL_PIPELINE_ALL:
-	case UNMAP_TRANSFORMS:
+	case MP_UNMAP_TRANSFORMS:
 		vkUnmapMemory(device, model.memory);
-	case DEVICE_MEMORY:
+	case MP_DEVICE_MEMORY:
 		vkFreeMemory(device, model.memory, NULL /* allocator */);
-	case MODEL_BUFFER:
+	case MP_MODEL_BUFFER:
 		vkDestroyBuffer(device, model.modelbuf, NULL /* allocator */);
-	case TRANSFORM_BUFFER:
+	case MP_TRANSFORM_BUFFER:
 		vkDestroyBuffer(device, model.transbuf, NULL /* allocator */);
-	case VERTEX_BUFFER:
+	case MP_VERTEX_BUFFER:
 		vkDestroyBuffer(device, model.vertbuf, NULL /* allocator */);
-	case PIPELINE:
+	case MP_PIPELINE:
 		vkDestroyPipeline(device, model.pipeline, NULL /* allocator */);
-	case SHADERS:
-	case FRAG_SHADER:
+	case MP_SHADERS:
+	case MP_FRAG_SHADER:
 		vkDestroyShaderModule(device, model.fragshader,
 			NULL /* allocator */);
-	case VERT_SHADER:
+	case MP_VERT_SHADER:
 		vkDestroyShaderModule(device, model.vertshader,
 			NULL /* allocator */);
-	case LAYOUT:
+	case MP_LAYOUT:
 		vkDestroyPipelineLayout(device, model.layout,
 			NULL /* allocator */);
-	case DESCRIPTOR_SET_LAYOUT:
+	case MP_DESCRIPTOR_SET_LAYOUT:
 		vkDestroyDescriptorSetLayout(device, model.dsetlayout,
+			NULL /* allocator */);
+	}
+}
+
+enum uistage {
+	UI_PIPELINE_ALL,
+	UP_SAMPLER,
+	UP_ICON_VIEW,
+	UP_IMAGE_MEMORY,
+	UP_ICON_IMAGE,
+	UP_BUFFER_MEMORY,
+	UP_ICON_BUFFER,
+	UP_INDEX_BUFFER,
+	UP_VERT_BUFFER,
+	UP_PIPELINE,
+	UP_SHADERS,
+	UP_FRAG_SHADER,
+	UP_VERT_SHADER,
+	UP_LAYOUT,
+	UP_DESCRIPTOR_SET,
+	UP_DESCRIPTOR_SET_LAYOUT,
+};
+
+void
+cleanup_ui(enum uistage stage)
+{
+	switch (stage) {
+	case UI_PIPELINE_ALL:
+	case UP_SAMPLER:
+		vkDestroySampler(device, ui.sampler, NULL /* allocator */);
+	case UP_ICON_VIEW:
+		for (size_t i = 0; i < ui.niconviews; i++)
+			vkDestroyImageView(device, ui.icons[i],
+				NULL /* allocator */);
+	case UP_IMAGE_MEMORY:
+		vkFreeMemory(device, ui.immem, NULL /* allocator */);
+	case UP_ICON_IMAGE:
+		for (size_t i = 0; i < ui.niconims; i++)
+			vkDestroyImage(device, ui.iconims[i],
+				NULL /* allocator */);
+	case UP_BUFFER_MEMORY:
+		vkFreeMemory(device, ui.bufmem, NULL /* allocator */);
+	case UP_ICON_BUFFER:
+		vkDestroyBuffer(device, ui.iconbuf, NULL /* allocator */);
+	case UP_INDEX_BUFFER:
+		vkDestroyBuffer(device, ui.idxbuf, NULL /* allocator */);
+	case UP_VERT_BUFFER:
+		vkDestroyBuffer(device, ui.vertbuf, NULL /* allocator */);
+	case UP_PIPELINE:
+		vkDestroyPipeline(device, ui.pipeline, NULL /* allocator */);
+	case UP_SHADERS:
+	case UP_FRAG_SHADER:
+		vkDestroyShaderModule(device, ui.fragshader,
+			NULL /* allocator */);
+	case UP_VERT_SHADER:
+		vkDestroyShaderModule(device, ui.vertshader,
+			NULL /* allocator */);
+	case UP_LAYOUT:
+		vkDestroyPipelineLayout(device, ui.layout,
+			NULL /* allocator */);
+	case UP_DESCRIPTOR_SET:
+		(void)NULL;
+	case UP_DESCRIPTOR_SET_LAYOUT:
+		vkDestroyDescriptorSetLayout(device, ui.dsetlayout,
 			NULL /* allocator */);
 	}
 }
@@ -379,12 +486,12 @@ cleanup_renderer(enum rendererstage s)
 		vkDestroyRenderPass(device, renderer.pass,
 			NULL /* allocator */);
 	case DEPTH_VIEW:
-		vkDestroyImageView(device, renderer.mdview,
+		vkDestroyImageView(device, renderer.depth,
 			NULL /* allocator */);
 	case DEPTH_MEMORY:
 		vkFreeMemory(device, renderer.memory, NULL /* allocator */);
 	case DEPTH_BUFFER:
-		vkDestroyImage(device, renderer.modeldepth,
+		vkDestroyImage(device, renderer.depthim,
 			NULL /* allocator */);
 	case DESCRIPTOR_POOL:
 		vkDestroyDescriptorPool(device, renderer.dpool,
@@ -396,6 +503,7 @@ enum gpustage {
 	DISPLAY,
 	RENDERER,
 	MODEL_PIPELINE,
+	UI_PIPELINE,
 	END,
 };
 
@@ -408,6 +516,8 @@ cleanup_before(enum gpustage stage)
 		vkGetDeviceQueue(device, qfamidx, 0, &queue);
 		vkQueueWaitIdle(queue);
 		vkDeviceWaitIdle(device);
+		cleanup_ui(UI_PIPELINE_ALL);
+	case UI_PIPELINE:
 		cleanup_model(MODEL_PIPELINE_ALL);
 	case MODEL_PIPELINE:
 		cleanup_renderer(RENDERER_ALL);
@@ -418,58 +528,56 @@ cleanup_before(enum gpustage stage)
 	}
 }
 
-static VkShaderModule
-read_shader(const char *filename, enum modelstage toclean)
-{
+static bool
+read_shader(
+	const char *filename,
+	VkShaderModule *out,
+	VkResult *res,
+	const char **msg
+) {
+	*res = VK_SUCCESS;
 	FILE *f = fopen(filename, "rb");
 	if (f == NULL) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
-		err(1, "couldn't open shader file for reading");
+		*msg = "couldn't open shader file for reading";
+		return false;
 	}
 	if (fseek(f, 0, SEEK_END) < 0) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
-		err(1, "couldn't seek to end of shader file");
+		*msg = "couldn't seek to end of shader file";
+		return false;
 	}
 	size_t codesz = ftell(f);
 	if (fseek(f, 0, SEEK_SET) < 0) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
-		err(1, "couldn't seek to start of shader file");
+		*msg = "couldn't seek to start of shader file";
+		return false;
 	}
 	uint32_t *code = malloc(codesz);
 	if (code == NULL) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
-		err(1, "couldn't allocate for shader code");
+		*msg = "couldn't allocate for shader code";
+		return false;
 	}
 	/* TODO: is endianness an issue here? */
 	size_t num = fread(code, 1, codesz, f);
 	if (num != codesz) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
 		if (ferror(f))
-			err(1, "couldn't read shader code into buffer");
+			*msg = "couldn't read shader code into buffer";
+		else
+			*msg = "unexpected end of file";
 	}
 	fclose(f);
 
-	VkShaderModule shader;
-	VkResult res;
-	res = vkCreateShaderModule(device, &(VkShaderModuleCreateInfo){
+	*res = vkCreateShaderModule(device, &(VkShaderModuleCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
 		.codeSize = codesz,
 		.pCode = code,
-	}, NULL /* allocator */, &shader);
-	if (res != VK_SUCCESS) {
-		cleanup_model(toclean);
-		cleanup_before(MODEL_PIPELINE);
-		errx(1, "couldn't create shader module: %s", vkstrerror(res));
+	}, NULL /* allocator */, out);
+	if (*res != VK_SUCCESS) {
+		*msg = "couldn't create shader module: ";
+		return false;
 	}
 
-	return shader;
+	return true;
 }
 
 static void
@@ -487,6 +595,7 @@ keycb(GLFWwindow *win, int key, int scancode, int action, int mods)
 static void
 mousecb(GLFWwindow *win, int button, int action, int mods)
 {
+	/* TODO: check that the mouse click is within model/ui bounds */
 	switch (button) {
 	case GLFW_MOUSE_BUTTON_LEFT:
 		if (action == GLFW_RELEASE) {
@@ -631,9 +740,9 @@ setup_cpu(void)
 	};
 
 	model.nobjs = ARR_SZ(files);
-	model.objs = malloc(sizeof(struct object) * model.nobjs);
+	model.objs = nmalloc(sizeof(struct object), model.nobjs);
 	if (model.objs == NULL) err(1, "couldn't allocate objects");
-	model.bounds = malloc(sizeof(struct bounds) * model.nobjs);
+	model.bounds = nmalloc(sizeof(struct bounds), model.nobjs);
 	if (model.bounds == NULL) err(1, "couldn't allocate bounding boxes");
 
 	FILE *fs[ARR_SZ(files)];
@@ -648,10 +757,10 @@ setup_cpu(void)
 		/* TODO: alignment is determined by the GPU */
 	}
 
-	model.meshes = malloc(sizeof(struct vertexinfo) * model.meshcnt);
+	model.meshes = nmalloc(sizeof(struct modelvertex), model.meshcnt);
 	if (model.meshes == NULL) err(1, "couldn't allocate meshes");
 	for (size_t i = 0; i < ARR_SZ(fs); i++) {
-		struct vertexinfo *vi = model.meshes + model.objs[i].meshidx;
+		struct modelvertex *vi = model.meshes + model.objs[i].meshidx;
 		struct boundingbox b = {
 			.offset = { 0, 0, 0 },
 			.extent = { -1, -1, -1 },
@@ -688,8 +797,90 @@ setup_cpu(void)
 		vec4_scale(model.bounds[i].curr.offset, b.extent, -20);
 		vec4_scale(model.bounds[i].curr.extent, b.extent, 40);
 	}
-
 	reset_camera();
+
+	const char *icons[] = {
+		/*
+		"black.tga",
+		 */
+		"open.tga",
+		"save.tga",
+	};
+	ui.nicons = ARR_SZ(icons);
+	ui.nverts = ui.nicons * 4;
+	ui.nidxs = ui.nicons * 6;
+	if ((ui.verts = nmalloc(sizeof(struct uivertex), ui.nverts)) == NULL)
+		err(1, "couldn't allocate vertices");
+	if ((ui.idxs = nmalloc(sizeof(uint32_t), ui.nidxs)) == NULL)
+		err(1, "couldn't allocate indices");
+	if ((ui.texels = nmalloc(sizeof(unsigned char *), ui.nicons)) == NULL)
+		err(1, "couldn't allocate texels");
+	if ((ui.boxes = nmalloc(sizeof(vec2), ui.nicons)) == NULL)
+		err(1, "couldn't allocate texel boxes");
+	memcpy(ui.verts, (struct uivertex[]) {
+		/*
+		{ .pos = { -1, -1 } },
+		{ .pos = { -1, 1 } },
+		{ .pos = { 1, -1 } },
+		{ .pos = { 1, 1 } },
+		*/
+
+		{ .pos = { 50, 120 } },
+		{ .pos = { 50+32, 120 } },
+		{ .pos = { 50, 120+32 } },
+		{ .pos = { 50+32, 120+32 } },
+
+		{ .pos = { 100, 120 } },
+		{ .pos = { 100+32, 120 } },
+		{ .pos = { 100, 120+32 } },
+		{ .pos = { 100+32, 120+32 } },
+	}, sizeof(struct uivertex) * ui.nverts);
+	memcpy(ui.idxs, (uint32_t[]) {
+		0, 1, 2,
+		2, 1, 3,
+
+		4, 5, 6,
+		6, 5, 7,
+	}, sizeof(uint32_t) * ui.nidxs);
+
+	ui.texelsz = 0;
+	for (size_t i = 0; i < ui.nicons; i++) {
+		int x, y, n, ok;
+		ok = stbi_info(icons[i], &x, &y, &n);
+		if (!ok) errx(1, "couldn't read size from %s", icons[i]);
+		if (n != 4)
+			errx(1, "%s doesn't have 4 colour channels", icons[i]);
+		/* TODO: overflow */
+		ui.texelsz += x * y * n;
+		memcpy(ui.boxes[i], (vec2){ x, y }, sizeof(vec2));
+	}
+	if ((ui.texels = nmalloc(1, ui.texelsz)) == NULL)
+		err(1, "couldn't allocate texel buffer");
+	if ((ui.texoff = nmalloc(sizeof(size_t), ui.nicons)) == NULL)
+		err(1, "couldn't allocate texture offset buffer");
+	ui.texelsz = 0;
+	for (size_t i = 0; i < ui.nicons; i++) {
+		int x, y, n;
+		unsigned char *data = stbi_load(icons[i], &x, &y, &n, 4);
+		if (data == NULL)
+			errx(1, "couldn't read %s", icons[i]);
+		memcpy(ui.texels + ui.texelsz, data, x * y * n);
+		ui.texoff[i] = ui.texelsz;
+		ui.texelsz += x * y * n;
+		stbi_image_free(data);
+	}
+
+	if ((ui.dsets = nmalloc(sizeof(VkDescriptorSet), ui.nicons)) == NULL)
+		err(1, "couldn't allocate space for descriptor sets");
+	if ((ui.iconoff = nmalloc(sizeof(size_t), ui.nicons)) == NULL)
+		err(1, "couldn't allocate icon offset buffer");
+	if ((ui.iconims = nmalloc(sizeof(VkImage), ui.nicons)) == NULL)
+		err(1, "couldn't allocate space for images");
+	if ((ui.imbinds = nmalloc(sizeof(VkBindImageMemoryInfo), ui.nicons))
+			== NULL)
+		err(1, "couldn't allocate space for image memory binds");
+	if ((ui.icons = nmalloc(sizeof(VkImageView), ui.nicons)) == NULL)
+		err(1, "couldn't allocate space for image views");
 }
 
 static void
@@ -733,11 +924,7 @@ setup_display(void)
 			" GLFW requested %zu and we requested %zu", numglfwexts,
 			ARR_SZ(manualexts));
 	size_t nexts = numglfwexts + ARR_SZ(manualexts);
-	if (SIZE_MAX / sizeof(char **) < nexts)
-		errx(1, "can't allocate space for %zu extensions"
-			" (%zu * sizeof(char **) > SIZE_MAX)", nexts);
-
-	const char **exts = malloc(sizeof(char **) * nexts);
+	const char **exts = nmalloc(sizeof(char **), nexts);
 	if (exts == NULL)
 		err(1, "couldn't allocate for instance extensions");
 	memcpy(exts, glfwexts, sizeof(char *) * numglfwexts);
@@ -812,14 +999,7 @@ setup_display(void)
 		errx(1, "coudln't get number of physical devices: %s",
 			vkstrerror(res));
 	}
-	if (SIZE_MAX / sizeof(VkPhysicalDevice) < (size_t)devcnt ||
-			(size_t)devcnt != devcnt) {
-		cleanup_display(SURFACE);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate space for %zu devices"
-			" (%zu * sizeof(VkPhysicalDevice) > SIZE_MAX)", devcnt);
-	}
-	VkPhysicalDevice *devs = malloc(sizeof(VkPhysicalDevice) * devcnt);
+	VkPhysicalDevice *devs = nmalloc(sizeof(VkPhysicalDevice), devcnt);
 	if (devs == NULL) {
 		cleanup_display(SURFACE);
 		cleanup_before(DISPLAY);
@@ -932,12 +1112,8 @@ setup_display(void)
 			vkstrerror(res));
 	}
 	size_t fmtcap = fmtcnt;
-	if (SIZE_MAX / sizeof(VkSurfaceFormat2KHR) < fmtcap) {
-		cleanup_display(DEVICE);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate %zu surface formats");
-	}
-	VkSurfaceFormat2KHR *fmts = malloc(sizeof(VkSurfaceFormat2KHR)*fmtcap);
+	VkSurfaceFormat2KHR *fmts =
+		nmalloc(sizeof(VkSurfaceFormat2KHR), fmtcap);
 	if (fmts == NULL) {
 		cleanup_display(DEVICE);
 		cleanup_before(DISPLAY);
@@ -988,12 +1164,7 @@ setup_display(void)
 			vkstrerror(res));
 	}
 	size_t modecap = modecnt;
-	if (SIZE_MAX / sizeof(VkPresentModeKHR) < modecap) {
-		cleanup_display(DEVICE);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate %zu present modes", modecap);
-	}
-	VkPresentModeKHR *modes = malloc(sizeof(VkPresentModeKHR)*modecap);
+	VkPresentModeKHR *modes = nmalloc(sizeof(VkPresentModeKHR), modecap);
 	if (modes == NULL) {
 		cleanup_display(DEVICE);
 		cleanup_before(DISPLAY);
@@ -1071,12 +1242,7 @@ setup_display(void)
 		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
 	}
 	size_t imcap = imcnt;
-	if (SIZE_MAX / sizeof(VkImage) < imcap) {
-		cleanup_display(SWAP_CHAIN);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate %zu images", imcap);
-	}
-	VkImage *ims = malloc(sizeof(VkImage) * imcap);
+	VkImage *ims = nmalloc(sizeof(VkImage), imcap);
 	if (ims == NULL) {
 		cleanup_display(SWAP_CHAIN);
 		cleanup_before(DISPLAY);
@@ -1102,14 +1268,7 @@ setup_display(void)
 	}
 	display.images = ims;
 	display.nims = imcnt;
-
-	if (SIZE_MAX / sizeof(VkSemaphore) < (size_t)imcnt ||
-			(size_t)imcnt != imcnt) {
-		cleanup_display(SWAP_CHAIN);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate %zu semaphores", imcnt);
-	}
-	display.semaphores = malloc(sizeof(VkSemaphore) * imcnt);
+	display.semaphores = nmalloc(sizeof(VkSemaphore), imcnt);
 	if (display.semaphores == NULL) {
 		cleanup_display(SWAP_CHAIN);
 		cleanup_before(DISPLAY);
@@ -1130,13 +1289,7 @@ setup_display(void)
 		display.nsems++;
 	}
 
-	if (SIZE_MAX / sizeof(VkImageView) < (size_t)display.nims ||
-			(size_t)display.nims != display.nims) {
-		cleanup_display(SEMAPHORES);
-		cleanup_before(DISPLAY);
-		errx(1, "can't allocate %zu image views", display.nims);
-	}
-	display.views = malloc(sizeof(VkImageView) * display.nims);
+	display.views = nmalloc(sizeof(VkImageView), display.nims);
 	if (display.views == NULL) {
 		cleanup_display(SEMAPHORES);
 		cleanup_before(DISPLAY);
@@ -1200,10 +1353,24 @@ setup_model(void)
 		},
 	}, NULL /* allocator */, &model.dsetlayout);
 	if (res != VK_SUCCESS) {
-		cleanup_renderer(RENDERER_ALL);
-		cleanup_before(RENDERER);
+		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate descriptor set layout: %s",
 			vkstrerror(res));
+	}
+
+	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.pNext = NULL,
+		.descriptorPool = renderer.dpool,
+		.descriptorSetCount = 1,
+		.pSetLayouts = (VkDescriptorSetLayout[]){
+			model.dsetlayout,
+		}
+	}, &model.dset);
+	if (res != VK_SUCCESS) {
+		cleanup_model(MP_DESCRIPTOR_SET_LAYOUT);
+		cleanup_before(MODEL_PIPELINE);
+		errx(1, "couldn't get a descriptor set: %s", vkstrerror(res));
 	}
 
 	res = vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
@@ -1218,16 +1385,31 @@ setup_model(void)
 		.pPushConstantRanges = NULL,
 	}, NULL /* allocator */, &model.layout);
 	if (res != VK_SUCCESS) {
-		cleanup_model(DESCRIPTOR_SET_LAYOUT);
+		cleanup_model(MP_DESCRIPTOR_SET_LAYOUT);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
 	}
 
-	model.vertshader = read_shader("vert.spv", LAYOUT);
-	model.fragshader = read_shader("frag.spv", VERT_SHADER);
+	const char *msg;
+	if (!read_shader("vert.model.spv", &model.vertshader, &res, &msg)) {
+		cleanup_model(MP_LAYOUT);
+		cleanup_before(MODEL_PIPELINE);
+		if (res != VK_SUCCESS)
+			errx(1, "%s: %s", msg, vkstrerror(res));
+		else
+			errx(1, "%s", msg);
+	}
+	if (!read_shader("frag.model.spv", &model.fragshader, &res, &msg)) {
+		cleanup_model(MP_VERT_SHADER);
+		cleanup_before(MODEL_PIPELINE);
+		if (res != VK_SUCCESS)
+			errx(1, "%s: %s", msg, vkstrerror(res));
+		else
+			errx(1, "%s", msg);
+	}
 
 	res = vkCreateGraphicsPipelines(device, NULL /* cache */, 1,
-			&(VkGraphicsPipelineCreateInfo){
+			&(VkGraphicsPipelineCreateInfo) {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
 		.pNext = NULL,
 		/* TODO: */ .flags = 0,
@@ -1257,7 +1439,7 @@ setup_model(void)
 			.vertexBindingDescriptionCount = 1,
 			.pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
 				.binding = 0,
-				.stride = sizeof(struct vertexinfo),
+				.stride = sizeof(struct modelvertex),
 				.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
 			},
 			.vertexAttributeDescriptionCount = 2,
@@ -1265,12 +1447,12 @@ setup_model(void)
 					.binding = 0,
 					.location = 0,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
-					.offset = offsetof(struct vertexinfo, pos),
+					.offset = offsetof(struct modelvertex, pos),
 				}, {
 					.binding = 0,
 					.location = 1,
 					.format = VK_FORMAT_R32G32B32_SFLOAT,
-					.offset = offsetof(struct vertexinfo, norm),
+					.offset = offsetof(struct modelvertex, norm),
 				},
 			},
 		},
@@ -1382,7 +1564,7 @@ setup_model(void)
 		.basePipelineIndex = 0,
 	}, NULL /* allocator */, &model.pipeline);
 	if (res != VK_SUCCESS) {
-		cleanup_model(SHADERS);
+		cleanup_model(MP_SHADERS);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't create graphics pipeline: %s",
 			vkstrerror(res));
@@ -1393,7 +1575,7 @@ setup_model(void)
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.size = sizeof(struct vertexinfo) * model.meshcnt,
+		.size = sizeof(struct modelvertex) * model.meshcnt,
 		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
 			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
@@ -1403,7 +1585,7 @@ setup_model(void)
 		},
 	}, NULL /* allocator */, &model.vertbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_model(PIPELINE);
+		cleanup_model(MP_PIPELINE);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
@@ -1422,7 +1604,7 @@ setup_model(void)
 		},
 	}, NULL /* allocator */, &model.transbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_model(VERTEX_BUFFER);
+		cleanup_model(MP_VERTEX_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
@@ -1438,20 +1620,20 @@ setup_model(void)
 		.queueFamilyIndexCount = 1,
 		.pQueueFamilyIndices = (uint32_t[]) {
 			qfamidx,
-			},
+		},
 	}, NULL /* allocator */, &model.modelbuf);
 	if (res != VK_SUCCESS) {
-		cleanup_model(TRANSFORM_BUFFER);
+		cleanup_model(MP_TRANSFORM_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
 	}
 
 	/* TODO: all of this can overflow */
 	VkMemoryRequirements memreq;
-	vkGetBufferMemoryRequirements(device, model.vertbuf, &memreq);
+	vkGetBufferMemoryRequirements(device, model.modelbuf, &memreq);
 	size_t align = memreq.alignment - 1;
 	model.meshsz =
-		(sizeof(struct vertexinfo) * model.meshcnt + align) & ~align;
+		(sizeof(struct modelvertex) * model.meshcnt + align) & ~align;
 	size_t transsz = (sizeof(mat4x4) * model.nobjs + align) & ~align;
 	size_t modelsz = (sizeof(mat4x4) * model.nobjs + align) & ~align;
 	size_t allocsz = max(memreq.size, model.meshsz + transsz + modelsz);
@@ -1462,7 +1644,7 @@ setup_model(void)
 		.memoryTypeIndex = memidx,
 	}, NULL /* allocator */, &model.memory);
 	if (res != VK_SUCCESS) {
-		cleanup_model(MODEL_BUFFER);
+		cleanup_model(MP_MODEL_BUFFER);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
 	}
@@ -1488,7 +1670,7 @@ setup_model(void)
 		},
 	});
 	if (res != VK_SUCCESS) {
-		cleanup_model(DEVICE_MEMORY);
+		cleanup_model(MP_DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
 	}
@@ -1497,17 +1679,17 @@ setup_model(void)
 	void *ptr;
 	res = vkMapMemory(device, model.memory, 0, model.meshsz, 0, &ptr); 
 	if (res != VK_SUCCESS) {
-		cleanup_model(DEVICE_MEMORY);
+		cleanup_model(MP_DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
-	memcpy(ptr, model.meshes, sizeof(struct vertexinfo)*model.meshcnt);
+	memcpy(ptr, model.meshes, sizeof(struct modelvertex)*model.meshcnt);
 	vkUnmapMemory(device, model.memory);
 
 	res = vkMapMemory(device, model.memory, model.meshsz, transsz+modelsz,
 		0, (void **)&model.transforms);
 	if (res != VK_SUCCESS) {
-		cleanup_model(DEVICE_MEMORY);
+		cleanup_model(MP_DEVICE_MEMORY);
 		cleanup_before(MODEL_PIPELINE);
 		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
 	}
@@ -1517,6 +1699,486 @@ setup_model(void)
 static void
 setup_ui(void)
 {
+	VkResult res;
+
+	res = vkCreateDescriptorSetLayout(device, &(VkDescriptorSetLayoutCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.bindingCount = 1,
+		.pBindings = (VkDescriptorSetLayoutBinding[]){ {
+				.binding = 0,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.descriptorCount = 1,
+				.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+				.pImmutableSamplers = NULL,
+			},
+		},
+	}, NULL /* allocator */, &ui.dsetlayout);
+	if (res != VK_SUCCESS) {
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate descriptor set layout: %s",
+			vkstrerror(res));
+	}
+
+	VkDescriptorSetLayout *layouts =
+		nmalloc(sizeof(VkDescriptorSetLayout), ui.nicons);
+	if (layouts == NULL) {
+		cleanup_ui(UP_DESCRIPTOR_SET_LAYOUT);
+		cleanup_before(UI_PIPELINE);
+		err(1, "couldn't allocate space for descriptor set layouts");
+	}
+	for (size_t i = 0; i < ui.nicons; i++)
+		layouts[i] = ui.dsetlayout;
+	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+		.pNext = NULL,
+		.descriptorPool = renderer.dpool,
+		.descriptorSetCount = ui.nicons,
+		.pSetLayouts = layouts,
+	}, ui.dsets);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_DESCRIPTOR_SET_LAYOUT);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't get a descriptor set: %s", vkstrerror(res));
+	}
+
+	res = vkCreatePipelineLayout(device, &(VkPipelineLayoutCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.setLayoutCount = ui.nicons,
+		.pSetLayouts = layouts,
+		.pushConstantRangeCount = 1,
+		.pPushConstantRanges = (VkPushConstantRange[]){ {
+				.stageFlags = VK_SHADER_STAGE_VERTEX_BIT,
+				.offset = 0,
+				.size = 3*sizeof(vec2),
+			},
+		},
+	}, NULL /* allocator */, &ui.layout);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_DESCRIPTOR_SET);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't create pipeline layout: %s", vkstrerror(res));
+	}
+	free(layouts);
+
+	const char *msg;
+	if (!read_shader("vert.ui.spv", &ui.vertshader, &res, &msg)) {
+		cleanup_ui(UP_LAYOUT);
+		cleanup_before(UI_PIPELINE);
+		if (res != VK_SUCCESS)
+			errx(1, "%s: %s", msg, vkstrerror(res));
+		else
+			errx(1, "%s", msg);
+	}
+	if (!read_shader("frag.ui.spv", &ui.fragshader, &res, &msg)) {
+		cleanup_ui(UP_VERT_SHADER);
+		cleanup_before(UI_PIPELINE);
+		if (res != VK_SUCCESS)
+			errx(1, "%s: %s", msg, vkstrerror(res));
+		else
+			errx(1, "%s", msg);
+	}
+
+	res = vkCreateGraphicsPipelines(device, NULL /* cache */, 1,
+			&(VkGraphicsPipelineCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+		.pNext = NULL,
+		/* TODO: */ .flags = 0,
+		.stageCount = 2,
+		.pStages = (VkPipelineShaderStageCreateInfo[]){ {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+				.pNext = NULL,
+				.flags = 0,
+				.stage = VK_SHADER_STAGE_VERTEX_BIT,
+				.module = ui.vertshader,
+				.pName = "main",
+				.pSpecializationInfo = NULL,
+			}, {
+				.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+			 	.pNext = NULL,
+			 	.flags = 0,
+			 	.stage = VK_SHADER_STAGE_FRAGMENT_BIT,
+			 	.module = ui.fragshader,
+			 	.pName = "main",
+			 	.pSpecializationInfo = NULL,
+			},
+		},
+		.pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.vertexBindingDescriptionCount = 1,
+			.pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
+				.binding = 0,
+				.stride = sizeof(struct uivertex),
+				.inputRate = VK_VERTEX_INPUT_RATE_VERTEX,
+			},
+			.vertexAttributeDescriptionCount = 1,
+			.pVertexAttributeDescriptions = (VkVertexInputAttributeDescription[]){{
+					.binding = 0,
+					.location = 0,
+					.format = VK_FORMAT_R32G32_SFLOAT,
+					.offset = offsetof(struct uivertex, pos),
+				},
+			},
+		},
+		.pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+			.primitiveRestartEnable = VK_FALSE,
+		},
+		.pTessellationState = &(VkPipelineTessellationStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			/* TODO: */ .patchControlPoints = 1,
+		},
+		.pViewportState = &(VkPipelineViewportStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+			.pNext = 0,
+			.flags = 0,
+			.viewportCount = 1,
+			.pViewports = &(VkViewport){
+				.x = 0,
+				.y = 0,
+				.width = (1-meshpct) * width,
+				.height = height,
+				.minDepth = 0.0,
+				.maxDepth = 1.0,
+			},
+			.scissorCount = 1,
+			.pScissors = &(VkRect2D){
+				.offset = (VkOffset2D){
+					.x = 0,
+					.y = 0
+				},
+				.extent = (VkExtent2D){
+					.width = (1-meshpct) * width,
+					.height = height
+				},
+			},
+		},
+		.pRasterizationState = &(VkPipelineRasterizationStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.depthClampEnable = VK_FALSE,
+			.rasterizerDiscardEnable = VK_FALSE,
+			.polygonMode = VK_POLYGON_MODE_FILL,
+			.cullMode = VK_CULL_MODE_NONE,
+			.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
+			.depthBiasEnable = VK_FALSE,
+			.depthBiasConstantFactor = 0,
+			.depthBiasClamp = 0,
+			.depthBiasSlopeFactor = 0,
+			/* TODO: */ .lineWidth = 1.0,
+		},
+		.pMultisampleState = &(VkPipelineMultisampleStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
+			.sampleShadingEnable = VK_FALSE,
+			.minSampleShading = 0,
+			.pSampleMask = NULL,
+			.alphaToCoverageEnable = VK_FALSE,
+			.alphaToOneEnable = VK_FALSE,
+		},
+		.pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.depthTestEnable = VK_FALSE,
+			.depthWriteEnable = VK_FALSE,
+			.depthCompareOp = VK_COMPARE_OP_ALWAYS,
+			.depthBoundsTestEnable = VK_FALSE,
+			.stencilTestEnable = VK_FALSE,
+			.front = { 0 },
+			.back = { 0 },
+			.minDepthBounds = 0.0,
+			.maxDepthBounds = 1.0,
+		},
+		.pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.logicOpEnable = VK_FALSE,
+			.logicOp = 0,
+			.attachmentCount = 1,
+			.pAttachments = &(VkPipelineColorBlendAttachmentState){
+				.blendEnable = VK_FALSE,
+				.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
+				.dstColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
+				.colorBlendOp = VK_BLEND_OP_ADD,
+				.srcAlphaBlendFactor = VK_BLEND_FACTOR_SRC_COLOR,
+				.dstAlphaBlendFactor = VK_BLEND_FACTOR_DST_COLOR,
+				.alphaBlendOp = VK_BLEND_OP_ADD,
+				.colorWriteMask = VK_COLOR_COMPONENT_R_BIT |
+					VK_COLOR_COMPONENT_G_BIT |
+					VK_COLOR_COMPONENT_B_BIT |
+					VK_COLOR_COMPONENT_A_BIT,
+			},
+			.blendConstants = { 0, 0, 0, 0 },
+		},
+		.pDynamicState = NULL,
+		.layout = ui.layout,
+		.renderPass = renderer.pass,
+		.subpass = 1,
+		.basePipelineHandle = 0,
+		.basePipelineIndex = 0,
+	}, NULL /* allocator */, &ui.pipeline);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_SHADERS);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't create graphics pipeline: %s",
+			vkstrerror(res));
+	}
+
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = sizeof(struct uivertex) * ui.nverts,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) { qfamidx },
+	}, NULL /* allocator */, &ui.vertbuf);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_PIPELINE);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = sizeof(uint32_t) * ui.nidxs,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) { qfamidx },
+	}, NULL /* allocator */, &ui.idxbuf);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_VERT_BUFFER);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	res = vkCreateBuffer(device, &(VkBufferCreateInfo) {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.size = ui.texelsz,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (uint32_t[]) { qfamidx },
+	}, NULL /* allocator */, &ui.iconbuf);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_INDEX_BUFFER);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate a buffer: %s", vkstrerror(res));
+	}
+
+	/* TODO: overflow */
+	/* TODO: alignment could be different per buffer / image */
+	VkMemoryRequirements memreq;
+	vkGetBufferMemoryRequirements(device, ui.vertbuf, &memreq);
+	size_t align = memreq.alignment - 1;
+	size_t vertsz = (sizeof(struct uivertex) * ui.nverts + align) & ~align;
+	size_t idxsz = (sizeof(uint32_t) * ui.nidxs + align) & ~align;
+	size_t texelsz = (ui.texelsz + align) & ~align;
+	size_t allocsz = vertsz + idxsz + texelsz;
+	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = NULL,
+		.allocationSize = allocsz,
+		.memoryTypeIndex = memidx,
+	}, NULL /* allocator */, &ui.bufmem);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_INDEX_BUFFER);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
+	}
+
+	res = vkBindBufferMemory2(device, 3, (VkBindBufferMemoryInfo[]){{
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = ui.vertbuf,
+			.memory = ui.bufmem,
+			.memoryOffset = 0,
+		}, {
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = ui.idxbuf,
+			.memory = ui.bufmem,
+			.memoryOffset = vertsz,
+		}, {
+			.sType = VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO,
+			.pNext = NULL,
+			.buffer = ui.iconbuf,
+			.memory = ui.bufmem,
+			.memoryOffset = vertsz + idxsz,
+		},
+	});
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_BUFFER_MEMORY);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't bind buffer memory: %s", vkstrerror(res));
+	}
+
+	unsigned char *ptr;
+	res = vkMapMemory(device, ui.bufmem, 0, allocsz, 0, (void **)&ptr); 
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_BUFFER_MEMORY);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't map buffer memory: %s", vkstrerror(res));
+	}
+	size_t off = 0;
+	memcpy(ptr+off, ui.verts, sizeof(struct uivertex) * ui.nverts);
+	off += vertsz;
+	memcpy(ptr+off, ui.idxs, sizeof(uint32_t) * ui.nidxs);
+	off += idxsz;
+	memcpy(ptr+off, ui.texels, ui.texelsz);
+	vkUnmapMemory(device, ui.bufmem);
+
+	ui.niconims = 0;
+	allocsz = 0;
+	for (size_t i = 0; i < ui.nicons; i++) {
+		res = vkCreateImage(device, &(VkImageCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.imageType = VK_IMAGE_TYPE_2D,
+			.format = VK_FORMAT_R8G8B8A8_UINT,
+			.extent = {
+				.width = ui.boxes[i][0],
+				.height = ui.boxes[i][1],
+				.depth = 1,
+			},
+			.mipLevels = 1,
+			.arrayLayers = 1,
+			.samples = VK_SAMPLE_COUNT_1_BIT,
+			.tiling = VK_IMAGE_TILING_OPTIMAL,
+			.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+				VK_IMAGE_USAGE_SAMPLED_BIT,
+			.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			.queueFamilyIndexCount = 1,
+			.pQueueFamilyIndices = (uint32_t[]){ qfamidx },
+			.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+		}, NULL /* allocator */, ui.iconims+i);
+		if (res != VK_SUCCESS) {
+			cleanup_ui(UP_ICON_IMAGE);
+			cleanup_before(RENDERER);
+			errx(1, "couldn't create image for depth buffer: %s",
+				vkstrerror(res));
+		}
+		ui.niconims++;
+
+		VkMemoryRequirements2 imreqs = {
+			.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+			.pNext = NULL,
+		};
+		vkGetImageMemoryRequirements2(device, &(VkImageMemoryRequirementsInfo2){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+			.pNext = NULL,
+			.image = ui.iconims[i],
+		}, &imreqs);
+		align = imreqs.memoryRequirements.alignment;
+		allocsz = (allocsz + align) & ~align;
+		ui.iconoff[i] = allocsz;
+		allocsz += imreqs.memoryRequirements.size;
+	}
+
+	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.pNext = NULL,
+		.allocationSize = allocsz,
+		.memoryTypeIndex = memidx,
+	}, NULL /* allocator */, &ui.immem);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_INDEX_BUFFER);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't allocate device memory: %s", vkstrerror(res));
+	}
+
+	for (size_t i = 0; i < ui.nicons; i++)
+		ui.imbinds[i] = (VkBindImageMemoryInfo){
+			.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+			.pNext = NULL,
+			.image = ui.iconims[i],
+			.memory = ui.immem,
+			.memoryOffset = ui.iconoff[i],
+		};
+	res = vkBindImageMemory2(device, ui.nicons, ui.imbinds);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_IMAGE_MEMORY);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't bind image memory: %s", vkstrerror(res));
+	}
+
+
+	ui.niconviews = 0;
+	for (size_t i = 0; i < ui.nicons; i++) {
+		res = vkCreateImageView(device, &(VkImageViewCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.image = ui.iconims[i],
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = VK_FORMAT_R8G8B8A8_UINT,
+			.components = { 0, },
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			}
+		}, NULL /* allocator */, ui.icons+i);
+		if (res != VK_SUCCESS) {
+			cleanup_ui(UP_ICON_VIEW);
+			cleanup_before(UI_PIPELINE);
+			errx(1, "couldn't create image view for icon: %s",
+				vkstrerror(res));
+		}
+		ui.niconviews++;
+	}
+
+	res = vkCreateSampler(device, &(VkSamplerCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+		.pNext = NULL,
+		.flags = 0,
+		.magFilter = VK_FILTER_NEAREST,
+		.minFilter = VK_FILTER_NEAREST,
+		.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+		.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+		.mipLodBias = 0,
+		.anisotropyEnable = VK_FALSE,
+		.maxAnisotropy = 0,
+		.compareEnable = VK_FALSE,
+		.compareOp = VK_COMPARE_OP_NEVER,
+		.minLod = 0,
+		.maxLod = 0,
+		.unnormalizedCoordinates = VK_FALSE,
+	}, NULL /* allocator */, &ui.sampler);
+	if (res != VK_SUCCESS) {
+		cleanup_ui(UP_ICON_VIEW);
+		cleanup_before(UI_PIPELINE);
+		errx(1, "couldn't create image sampler: %s", vkstrerror(res));
+	}
 }
 
 static void
@@ -1528,14 +2190,17 @@ setup_renderer(void)
 		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.maxSets = 1,
-		.poolSizeCount = 2,
+		.maxSets = 1 + ui.nicons,
+		.poolSizeCount = 3,
 		.pPoolSizes = (VkDescriptorPoolSize[]){ {
 				.type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
 				.descriptorCount = 1,
 			}, {
 				.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
 				.descriptorCount = 2,
+			}, {
+				.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.descriptorCount = ui.nicons,
 			},
 		},
 	}, NULL /* allocator */, &renderer.dpool);
@@ -1565,7 +2230,7 @@ setup_renderer(void)
 		.queueFamilyIndexCount = 1,
 		.pQueueFamilyIndices = (uint32_t[]){ qfamidx },
 		.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-	}, NULL /* allocator */, &renderer.modeldepth);
+	}, NULL /* allocator */, &renderer.depthim);
 	if (res != VK_SUCCESS) {
 		cleanup_renderer(DESCRIPTOR_POOL);
 		cleanup_before(RENDERER);
@@ -1580,7 +2245,7 @@ setup_renderer(void)
 	vkGetImageMemoryRequirements2(device, &(VkImageMemoryRequirementsInfo2){
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
 		.pNext = NULL,
-		.image = renderer.modeldepth,
+		.image = renderer.depthim,
 	}, &imreqs);
 	res = vkAllocateMemory(device, &(VkMemoryAllocateInfo){
 		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
@@ -1599,7 +2264,7 @@ setup_renderer(void)
 	res = vkBindImageMemory2(device, 1, (VkBindImageMemoryInfo[]){{
 			.sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
 			.pNext = NULL,
-			.image = renderer.modeldepth,
+			.image = renderer.depthim,
 			.memory = renderer.memory,
 			.memoryOffset = 0,
 		},
@@ -1614,7 +2279,7 @@ setup_renderer(void)
 		.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
 		.pNext = NULL,
 		.flags = 0,
-		.image = renderer.modeldepth,
+		.image = renderer.depthim,
 		.viewType = VK_IMAGE_VIEW_TYPE_2D,
 		.format = VK_FORMAT_D32_SFLOAT,
 		.components = { 0, },
@@ -1625,7 +2290,7 @@ setup_renderer(void)
 			.baseArrayLayer = 0,
 			.layerCount = 1,
 		}
-	}, NULL /* allocator */, &renderer.mdview);
+	}, NULL /* allocator */, &renderer.depth);
 	if (res != VK_SUCCESS) {
 		cleanup_renderer(DEPTH_MEMORY);
 		cleanup_before(RENDERER);
@@ -1660,31 +2325,58 @@ setup_renderer(void)
 				.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
 			},
 		},
-		.subpassCount = 1,
-		.pSubpasses = &(VkSubpassDescription){
-			.flags = 0,
-			.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
-			.inputAttachmentCount = 0,
-			.pInputAttachments = NULL,
-			.colorAttachmentCount = 1,
-			.pColorAttachments = (VkAttachmentReference[]){ {
-					.attachment = 0,
-					.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.subpassCount = 2,
+		.pSubpasses = (VkSubpassDescription[]){ {
+				.flags = 0,
+				.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+				.inputAttachmentCount = 0,
+				.pInputAttachments = NULL,
+				.colorAttachmentCount = 1,
+				.pColorAttachments = (VkAttachmentReference[]){ {
+						.attachment = 0,
+						.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					},
+				 },
+				.pResolveAttachments = NULL,
+				.pDepthStencilAttachment = (VkAttachmentReference[]){ {
+						.attachment = 1,
+						.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+					},
 				},
-			 },
-			.pResolveAttachments = NULL,
-			.pDepthStencilAttachment = (VkAttachmentReference[]){ {
-					.attachment = 1,
-					.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+				.preserveAttachmentCount = 0,
+				.pPreserveAttachments = NULL,
+			}, {
+				.flags = 0,
+				.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS,
+				.inputAttachmentCount = 0,
+				.pInputAttachments = NULL,
+				.colorAttachmentCount = 1,
+				.pColorAttachments = (VkAttachmentReference[]){ {
+						.attachment = 0,
+						.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+					},
+				 },
+				.pResolveAttachments = NULL,
+				.pDepthStencilAttachment = (VkAttachmentReference[]){ {
+						.attachment = 1,
+						.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+					},
 				},
+				.preserveAttachmentCount = 0,
+				.pPreserveAttachments = NULL,
 			},
-			.preserveAttachmentCount = 0,
-			.pPreserveAttachments = NULL,
 		},
-		.dependencyCount = 1,
-		.pDependencies = (VkSubpassDependency[]){{
+		.dependencyCount = 2,
+		.pDependencies = (VkSubpassDependency[]){ {
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.dstSubpass = 0,
+				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
+				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+			}, {
+				.srcSubpass = VK_SUBPASS_EXTERNAL,
+				.dstSubpass = 1,
 				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
@@ -1698,7 +2390,7 @@ setup_renderer(void)
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
 	}
 
-	display.framebuffers = malloc(sizeof(VkFramebuffer) * display.nims);
+	display.framebuffers = nmalloc(sizeof(VkFramebuffer), display.nims);
 	if (display.framebuffers == NULL) {
 		cleanup_renderer(RENDER_PASS);
 		cleanup_before(RENDERER);
@@ -1714,7 +2406,7 @@ setup_renderer(void)
 			.attachmentCount = 2,
 			.pAttachments = (VkImageView[]) {
 				display.views[i],
-				renderer.mdview,
+				renderer.depth,
 			},
 			.width = width,
 			.height = height,
@@ -1777,25 +2469,8 @@ setup_renderer(void)
 }
 
 static void
-render_model(void)
+prerender_model(void)
 {
-	VkResult res;
-
-	VkDescriptorSet dset;
-	res = vkAllocateDescriptorSets(device, &(VkDescriptorSetAllocateInfo){
-		.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-		.pNext = NULL,
-		.descriptorPool = renderer.dpool,
-		.descriptorSetCount = 1,
-		.pSetLayouts = (VkDescriptorSetLayout[]){
-			model.dsetlayout,
-		}
-	}, &dset);
-	if (res != VK_SUCCESS) {
-		warnx("couldn't get a descriptor set: %s", vkstrerror(res));
-		return;
-	}
-
 	for (size_t i = 0; i < model.nobjs; i++) {
 		mat4x4 A, M, V, P;
 
@@ -1818,7 +2493,7 @@ render_model(void)
 	vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
 			.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
 			.pNext = NULL,
-			.dstSet = dset,
+			.dstSet = model.dset,
 			.dstBinding = 0,
 			.dstArrayElement = 0,
 			.descriptorCount = 2,
@@ -1837,9 +2512,14 @@ render_model(void)
 			.pTexelBufferView = NULL,
 		},
 	}, 0, NULL);
+}
+
+static void
+render_model(void)
+{
 	vkCmdBindDescriptorSets(renderer.cmdbuf,
 		VK_PIPELINE_BIND_POINT_GRAPHICS, model.layout, 0, 1,
-		&dset, 2, (uint32_t[]){ 0, 0 });
+		&model.dset, 2, (uint32_t[]){ 0, 0 });
 	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		model.pipeline);
 	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
@@ -1849,8 +2529,127 @@ render_model(void)
 }
 
 static void
+prerender_ui(void)
+{
+
+	for (size_t i = 0; i < ui.nicons; i++) {
+		vkCmdPipelineBarrier(renderer.cmdbuf,
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_DEPENDENCY_BY_REGION_BIT,
+			0, NULL,
+			0, NULL,
+			1, (VkImageMemoryBarrier[]){ {
+					.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					.pNext = NULL,
+					.srcAccessMask = 0,
+					.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+					.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+					.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.image = ui.iconims[i],
+					.subresourceRange = (VkImageSubresourceRange){
+						.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel = 0,
+						.levelCount = 1,
+						.baseArrayLayer = 0,
+						.layerCount = 1,
+					},
+				},
+			});
+		vkCmdCopyBufferToImage(renderer.cmdbuf, ui.iconbuf,
+			ui.iconims[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+			1, &(VkBufferImageCopy){
+				.bufferOffset = ui.texoff[i],
+				.bufferRowLength = ui.boxes[i][0],
+				.bufferImageHeight = ui.boxes[i][1],
+				.imageSubresource = (VkImageSubresourceLayers){
+					.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+					.mipLevel = 0,
+					.baseArrayLayer = 0,
+					.layerCount = 1,
+				},
+				.imageOffset = (VkOffset3D){
+					.x = 0,
+					.y = 0,
+					.z = 0,
+				},
+				.imageExtent = (VkExtent3D){
+					.width = ui.boxes[i][0],
+					.height = ui.boxes[i][1],
+					.depth = 1,
+				},
+			});
+		vkCmdPipelineBarrier(renderer.cmdbuf,
+			VK_PIPELINE_STAGE_TRANSFER_BIT,
+			VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+			VK_DEPENDENCY_BY_REGION_BIT,
+			0, NULL,
+			0, NULL,
+			1, (VkImageMemoryBarrier[]){ {
+					.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+					.pNext = NULL,
+					.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+					.dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+					.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+					.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+					.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+					.image = ui.iconims[i],
+					.subresourceRange = (VkImageSubresourceRange){
+						.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+						.baseMipLevel = 0,
+						.levelCount = 1,
+						.baseArrayLayer = 0,
+						.layerCount = 1,
+					},
+				},
+			});
+		vkUpdateDescriptorSets(device, 1, (VkWriteDescriptorSet[]){{
+				.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+				.pNext = NULL,
+				.dstSet = ui.dsets[i],
+				.dstBinding = 0,
+				.dstArrayElement = 0,
+				.descriptorCount = 1,
+				.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+				.pImageInfo = &(VkDescriptorImageInfo) {
+					.sampler = ui.sampler,
+					.imageView = ui.icons[i],
+					.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+				},
+				.pBufferInfo = NULL,
+				.pTexelBufferView = NULL,
+			},
+		}, 0, NULL);
+	}
+}
+
+static void
 render_ui(void)
 {
+	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		ui.pipeline);
+	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
+		(VkBuffer[]){ ui.vertbuf }, (VkDeviceSize[]){ 0 });
+	vkCmdBindIndexBuffer(renderer.cmdbuf, ui.idxbuf, 0,
+		VK_INDEX_TYPE_UINT32);
+	for (size_t i = 0; i < ui.nicons; i++) {
+		vkCmdBindDescriptorSets(renderer.cmdbuf,
+			VK_PIPELINE_BIND_POINT_GRAPHICS, ui.layout, 0, 1,
+			ui.dsets+i, 0, NULL);
+		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
+			VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vec2),
+			&(vec2){ (1-meshpct)*width, height });
+		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
+			VK_SHADER_STAGE_VERTEX_BIT, sizeof(vec2), sizeof(vec2),
+			ui.boxes[i]);
+		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
+			VK_SHADER_STAGE_VERTEX_BIT, 2*sizeof(vec2),
+			sizeof(vec2), ui.verts[6*i].pos);
+		vkCmdDrawIndexed(renderer.cmdbuf, 6, 1, i*6, 0, 0);
+	}
 }
 
 static void
@@ -1887,17 +2686,19 @@ render(void)
 	});
 	if (res != VK_SUCCESS) {
 		warnx("couldn't begin command buffer: %s", vkstrerror(res));
-		goto free_dset;
+		return;
 	}
 
+	prerender_model();
+	prerender_ui();
 	vkCmdBeginRenderPass(renderer.cmdbuf, &(VkRenderPassBeginInfo){
 		.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
 		.pNext = NULL,
 		.renderPass = renderer.pass,
 		.framebuffer = display.framebuffers[idx],
 		.renderArea = {
-			.offset = { .x = (1-meshpct)*width, .y = 0 },
-			.extent = { .width = meshpct*width, .height = height },
+			.offset = { .x = 0, .y = 0 },
+			.extent = { .width = width, .height = height },
 		},
 		.clearValueCount = 2,
 		.pClearValues = (VkClearValue[]) { {
@@ -1911,6 +2712,7 @@ render(void)
 		},
 	}, VK_SUBPASS_CONTENTS_INLINE);
 	render_model();
+	vkCmdNextSubpass(renderer.cmdbuf, VK_SUBPASS_CONTENTS_INLINE);
 	render_ui();
 	vkCmdEndRenderPass(renderer.cmdbuf);
 	vkEndCommandBuffer(renderer.cmdbuf);
@@ -1926,9 +2728,7 @@ render(void)
 			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
 		},
 		.commandBufferCount = 1,
-		.pCommandBuffers = (VkCommandBuffer[]){
-			renderer.cmdbuf,
-		},
+		.pCommandBuffers = (VkCommandBuffer[]){ renderer.cmdbuf },
 		.signalSemaphoreCount = 1,
 		.pSignalSemaphores = (VkSemaphore[]){ display.semaphores[idx] },
 	}, renderer.fence);
@@ -1951,9 +2751,6 @@ render(void)
 	if (res != VK_SUCCESS)
 		warnx("couldn't wait on fence");
 	vkResetFences(device, 1, (VkFence[]){ renderer.fence });
-
-free_dset:
-	vkResetDescriptorPool(device, renderer.dpool, 0);
 }
 
 int
