@@ -800,9 +800,7 @@ setup_cpu(void)
 	reset_camera();
 
 	const char *icons[] = {
-		/*
 		"black.tga",
-		 */
 		"open.tga",
 		"save.tga",
 	};
@@ -818,12 +816,10 @@ setup_cpu(void)
 	if ((ui.boxes = nmalloc(sizeof(vec2), ui.nicons)) == NULL)
 		err(1, "couldn't allocate texel boxes");
 	memcpy(ui.verts, (struct uivertex[]) {
-		/*
-		{ .pos = { -1, -1 } },
-		{ .pos = { -1, 1 } },
-		{ .pos = { 1, -1 } },
-		{ .pos = { 1, 1 } },
-		*/
+		{ .pos = { 0, 0 } },
+		{ .pos = { (1-meshpct)*width, 0 } },
+		{ .pos = { 0, height } },
+		{ .pos = { (1-meshpct)*width, height } },
 
 		{ .pos = { 50, 120 } },
 		{ .pos = { 50+32, 120 } },
@@ -835,13 +831,16 @@ setup_cpu(void)
 		{ .pos = { 100, 120+32 } },
 		{ .pos = { 100+32, 120+32 } },
 	}, sizeof(struct uivertex) * ui.nverts);
-	memcpy(ui.idxs, (uint32_t[]) {
-		0, 1, 2,
-		2, 1, 3,
-
-		4, 5, 6,
-		6, 5, 7,
-	}, sizeof(uint32_t) * ui.nidxs);
+	for (size_t i = 0; i < ui.nicons; i++) {
+		size_t idx = i * 6;
+		size_t vtx = i * 4;
+		ui.idxs[idx+0] = vtx + 0;
+		ui.idxs[idx+1] = vtx + 1;
+		ui.idxs[idx+2] = vtx + 2;
+		ui.idxs[idx+3] = vtx + 2;
+		ui.idxs[idx+4] = vtx + 1;
+		ui.idxs[idx+5] = vtx + 3;
+	}
 
 	ui.texelsz = 0;
 	for (size_t i = 0; i < ui.nicons; i++) {
@@ -2635,13 +2634,13 @@ render_ui(void)
 		(VkBuffer[]){ ui.vertbuf }, (VkDeviceSize[]){ 0 });
 	vkCmdBindIndexBuffer(renderer.cmdbuf, ui.idxbuf, 0,
 		VK_INDEX_TYPE_UINT32);
+	vkCmdPushConstants(renderer.cmdbuf, ui.layout,
+		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vec2),
+		&(vec2){ (1-meshpct)*width, height });
 	for (size_t i = 0; i < ui.nicons; i++) {
 		vkCmdBindDescriptorSets(renderer.cmdbuf,
 			VK_PIPELINE_BIND_POINT_GRAPHICS, ui.layout, 0, 1,
 			ui.dsets+i, 0, NULL);
-		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
-			VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vec2),
-			&(vec2){ (1-meshpct)*width, height });
 		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
 			VK_SHADER_STAGE_VERTEX_BIT, sizeof(vec2), sizeof(vec2),
 			ui.boxes[i]);
