@@ -2093,7 +2093,7 @@ setup_ui(void)
 			.pNext = NULL,
 			.image = ui.iconims[i],
 		}, &imreqs);
-		align = imreqs.memoryRequirements.alignment;
+		align = imreqs.memoryRequirements.alignment - 1;
 		allocsz = (allocsz + align) & ~align;
 		ui.iconoff[i] = allocsz;
 		allocsz += imreqs.memoryRequirements.size;
@@ -2356,26 +2356,15 @@ setup_renderer(void)
 					},
 				 },
 				.pResolveAttachments = NULL,
-				.pDepthStencilAttachment = (VkAttachmentReference[]){ {
-						.attachment = 1,
-						.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-					},
-				},
+				.pDepthStencilAttachment = NULL,
 				.preserveAttachmentCount = 0,
 				.pPreserveAttachments = NULL,
 			},
 		},
-		.dependencyCount = 2,
+		.dependencyCount = 1,
 		.pDependencies = (VkSubpassDependency[]){ {
 				.srcSubpass = VK_SUBPASS_EXTERNAL,
 				.dstSubpass = 0,
-				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
-				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
-				.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-			}, {
-				.srcSubpass = VK_SUBPASS_EXTERNAL,
-				.dstSubpass = 1,
 				.srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
 				.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
 				.dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
@@ -2646,7 +2635,7 @@ render_ui(void)
 			ui.boxes[i]);
 		vkCmdPushConstants(renderer.cmdbuf, ui.layout,
 			VK_SHADER_STAGE_VERTEX_BIT, 2*sizeof(vec2),
-			sizeof(vec2), ui.verts[6*i].pos);
+			sizeof(vec2), ui.verts[4*i].pos);
 		vkCmdDrawIndexed(renderer.cmdbuf, 6, 1, i*6, 0, 0);
 	}
 }
