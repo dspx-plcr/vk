@@ -991,8 +991,10 @@ setup_display(void)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	display.window = glfwCreateWindow(
-		width, height, progname, glfwGetPrimaryMonitor(), NULL);
+	glfwWindowHint(GLFW_RESIZABLE, GLFW_TRUE);
+	glfwWindowHint(GLFW_DECORATED, GLFW_TRUE);
+	glfwWindowHint(GLFW_MAXIMIZED, GLFW_FALSE);
+	display.window = glfwCreateWindow(width, height, progname, NULL, NULL);
 	if (display.window == NULL) {
 		const char *msg;
 		(void)glfwGetError(&msg);
@@ -1010,9 +1012,7 @@ setup_display(void)
 		errx(1, "couldn't create surface for window: %s",
 			vkstrerror(res));
 	}
-	display.width = width;
-	display.height = height;
-	glfwSetWindowSize(display.window, display.width, display.height);
+	glfwGetWindowSize(display.window, &display.width, &display.height);
 	glfwSetKeyCallback(display.window, &keycb);
 	glfwSetMouseButtonCallback(display.window, &mousecb);
 	glfwSetScrollCallback(display.window, &scrollcb);
