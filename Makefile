@@ -1,7 +1,8 @@
 .SUFFIXES: .glsl .spv
 
-GLSL = glslang
-GFLAGS = --target-env vulkan1.1 -S $$(echo $^ | sed -e 's/\.[^.]*\.glsl//')
+GLSL = glslc
+GFLAGS = --target-env=vulkan1.1 \
+	-fshader-stage=$$(echo $^ | sed -e 's/\.[^.]*\.glsl//')
 CFLAGS = -std=gnu99 -pedantic -Wall -Wextra -g
 LDFLAGS = -lvulkan -lm -lglfw
 TARGET = vk

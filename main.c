@@ -990,7 +990,6 @@ setup_display(void)
 	if (res != VK_SUCCESS)
 		errx(1, "couldn't create vulkan instance: %s", vkstrerror(res));
 
-	/* TODO: allow resizing and window decorations */
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
 	display.window = glfwCreateWindow(
 		width, height, progname, glfwGetPrimaryMonitor(), NULL);
@@ -2474,7 +2473,7 @@ setup_screen(void)
 			.layers = 1,
 		}, NULL /* allocator */, display.framebuffers+i);
 		if (res != VK_SUCCESS) {
-			cleanup_renderer(FRAMEBUFFERS);
+			cleanup_screen(FRAMEBUFFERS);
 			cleanup_before(RENDERER);
 			errx(1, "coudln't allocate frame buffer: %s",
 				vkstrerror(res));
@@ -2692,7 +2691,9 @@ render(void)
 {
 	VkResult res;
 
+	VkQueue queue;
 	uint32_t idx;
+	vkGetDeviceQueue(device, qfamidx, 0, &queue);
 	res = vkAcquireNextImage2KHR(device, &(VkAcquireNextImageInfoKHR){
 		.sType = VK_STRUCTURE_TYPE_ACQUIRE_NEXT_IMAGE_INFO_KHR,
 		.pNext = NULL,
@@ -2702,8 +2703,9 @@ render(void)
 		.fence = VK_NULL_HANDLE,
 		.deviceMask = 1,
 	}, &idx);
-	if (res != VK_SUCCESS) {
-		warnx("couldn't acquire image for presentation");
+	if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR) {
+		warnx("couldn't acquire image for presentation: %s",
+			vkstrerror(res));
 		return;
 	}
 
@@ -2755,8 +2757,6 @@ render(void)
 	vkCmdEndRenderPass(renderer.cmdbuf);
 	vkEndCommandBuffer(renderer.cmdbuf);
 
-	VkQueue queue;
-	vkGetDeviceQueue(device, qfamidx, 0, &queue);
 	res = vkQueueSubmit(queue, 1, &(VkSubmitInfo){
 		.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
 		.pNext = NULL,
