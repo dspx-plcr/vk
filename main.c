@@ -26,7 +26,7 @@ static const char *progname = "My Little Vulkan App";
 static const float width = 1920;
 static const float height = 1080;
 static const float depth = 1000;
-static const float meshpct = 0.9;
+static const float uiwidth = width / 10;
 
 static const double panspeed = 0.2;
 static const double rotspeed = PI / (2 * width);
@@ -39,6 +39,9 @@ static uint32_t memidx;
 
 static struct {
 	GLFWwindow *window;
+	int width;
+	int height;
+	bool resize;
 	VkSurfaceKHR surface;
 	VkSwapchainKHR swapchain;
 	VkSemaphore *semaphores;
@@ -302,9 +305,6 @@ enum displaystage {
 	INSTANCE,
 	SURFACE,
 	DEVICE,
-	SWAP_CHAIN,
-	SEMAPHORES,
-	IMAGE_VIEWS,
 	DISPLAY_ALL,
 };
 
@@ -313,19 +313,6 @@ cleanup_display(enum displaystage stage)
 {
 	switch (stage) {
 	case DISPLAY_ALL:
-	case IMAGE_VIEWS:
-		for (size_t i = 0; i < display.nviews; i++)
-			vkDestroyImageView(device, display.views[i],
-				NULL /* allocator */);
-		display.nviews = 0;
-	case SEMAPHORES:
-		for (size_t i = 0; i < display.nsems; i++)
-			vkDestroySemaphore(device, display.semaphores[i],
-				NULL /* allocator */);
-		display.nsems = 0;
-	case SWAP_CHAIN:
-		vkDestroySwapchainKHR(
-			device, display.swapchain, NULL /* allocator */);
 	case DEVICE:
 		vkDestroyDevice(device, NULL /* allocator */);
 	case SURFACE:
@@ -358,14 +345,14 @@ cleanup_model(enum modelstage stage)
 	case MODEL_PIPELINE_ALL:
 	case MP_UNMAP_TRANSFORMS:
 		vkUnmapMemory(device, model.memory);
-	case MP_DEVICE_MEMORY:
-		vkFreeMemory(device, model.memory, NULL /* allocator */);
 	case MP_MODEL_BUFFER:
 		vkDestroyBuffer(device, model.modelbuf, NULL /* allocator */);
 	case MP_TRANSFORM_BUFFER:
 		vkDestroyBuffer(device, model.transbuf, NULL /* allocator */);
 	case MP_VERTEX_BUFFER:
 		vkDestroyBuffer(device, model.vertbuf, NULL /* allocator */);
+	case MP_DEVICE_MEMORY:
+		vkFreeMemory(device, model.memory, NULL /* allocator */);
 	case MP_PIPELINE:
 		vkDestroyPipeline(device, model.pipeline, NULL /* allocator */);
 	case MP_SHADERS:
@@ -414,20 +401,20 @@ cleanup_ui(enum uistage stage)
 		for (size_t i = 0; i < ui.niconviews; i++)
 			vkDestroyImageView(device, ui.icons[i],
 				NULL /* allocator */);
-	case UP_IMAGE_MEMORY:
-		vkFreeMemory(device, ui.immem, NULL /* allocator */);
 	case UP_ICON_IMAGE:
 		for (size_t i = 0; i < ui.niconims; i++)
 			vkDestroyImage(device, ui.iconims[i],
 				NULL /* allocator */);
-	case UP_BUFFER_MEMORY:
-		vkFreeMemory(device, ui.bufmem, NULL /* allocator */);
+	case UP_IMAGE_MEMORY:
+		vkFreeMemory(device, ui.immem, NULL /* allocator */);
 	case UP_ICON_BUFFER:
 		vkDestroyBuffer(device, ui.iconbuf, NULL /* allocator */);
 	case UP_INDEX_BUFFER:
 		vkDestroyBuffer(device, ui.idxbuf, NULL /* allocator */);
 	case UP_VERT_BUFFER:
 		vkDestroyBuffer(device, ui.vertbuf, NULL /* allocator */);
+	case UP_BUFFER_MEMORY:
+		vkFreeMemory(device, ui.bufmem, NULL /* allocator */);
 	case UP_PIPELINE:
 		vkDestroyPipeline(device, ui.pipeline, NULL /* allocator */);
 	case UP_SHADERS:
@@ -453,7 +440,6 @@ enum rendererstage {
 	DEPTH_BUFFER,
 	DEPTH_MEMORY,
 	DEPTH_VIEW,
-	FRAMEBUFFERS,
 	RENDER_PASS,
 	POOL,
 	ACQUIRE_SEMAPHORE,
@@ -478,25 +464,54 @@ cleanup_renderer(enum rendererstage s)
 	case POOL:
 		vkDestroyCommandPool(device, renderer.cpool,
 			NULL /* allocator */);
-	case FRAMEBUFFERS:
-		for (size_t i = 0; i < display.nfbs; i++)
-			vkDestroyFramebuffer(device, display.framebuffers[i],
-				NULL /* allocator */);
-		display.nfbs = 0;
 	case RENDER_PASS:
 		vkDestroyRenderPass(device, renderer.pass,
 			NULL /* allocator */);
 	case DEPTH_VIEW:
 		vkDestroyImageView(device, renderer.depth,
 			NULL /* allocator */);
-	case DEPTH_MEMORY:
-		vkFreeMemory(device, renderer.memory, NULL /* allocator */);
 	case DEPTH_BUFFER:
 		vkDestroyImage(device, renderer.depthim,
 			NULL /* allocator */);
+	case DEPTH_MEMORY:
+		vkFreeMemory(device, renderer.memory, NULL /* allocator */);
 	case DESCRIPTOR_POOL:
 		vkDestroyDescriptorPool(device, renderer.dpool,
 			NULL /* allocator */);
+	}
+}
+
+enum screenstage {
+	SWAP_CHAIN,
+	SEMAPHORES,
+	IMAGE_VIEWS,
+	FRAMEBUFFERS,
+	SCREEN_ALL,
+};
+
+static void
+cleanup_screen(enum screenstage stage)
+{
+	switch (stage) {
+	case SCREEN_ALL:
+	case FRAMEBUFFERS:
+		for (size_t i = 0; i < display.nfbs; i++)
+			vkDestroyFramebuffer(device, display.framebuffers[i],
+				NULL /* allocator */);
+		display.nfbs = 0;
+	case IMAGE_VIEWS:
+		for (size_t i = 0; i < display.nviews; i++)
+			vkDestroyImageView(device, display.views[i],
+				NULL /* allocator */);
+		display.nviews = 0;
+	case SEMAPHORES:
+		for (size_t i = 0; i < display.nsems; i++)
+			vkDestroySemaphore(device, display.semaphores[i],
+				NULL /* allocator */);
+		display.nsems = 0;
+	case SWAP_CHAIN:
+		vkDestroySwapchainKHR(
+			device, display.swapchain, NULL /* allocator */);
 	}
 }
 
@@ -505,6 +520,7 @@ enum gpustage {
 	RENDERER,
 	MODEL_PIPELINE,
 	UI_PIPELINE,
+	SCREEN,
 	END,
 };
 
@@ -517,6 +533,8 @@ cleanup_before(enum gpustage stage)
 		vkGetDeviceQueue(device, qfamidx, 0, &queue);
 		vkQueueWaitIdle(queue);
 		vkDeviceWaitIdle(device);
+		cleanup_screen(SCREEN_ALL);
+	case SCREEN:
 		cleanup_ui(UI_PIPELINE_ALL);
 	case UI_PIPELINE:
 		cleanup_model(MODEL_PIPELINE_ALL);
@@ -720,6 +738,15 @@ cursorcb(GLFWwindow *win, double x, double y)
 }
 
 static void
+resizecb(GLFWwindow *win, int w, int h)
+{
+      (void)win;
+      display.width = w;
+      display.height = h;
+      display.resize = true;
+}
+
+static void
 expand_box(struct boundingbox *box, vec3 point, size_t axis)
 {
 	if (box->extent[axis] < 0) {
@@ -818,9 +845,9 @@ setup_cpu(void)
 		err(1, "couldn't allocate texel boxes");
 	memcpy(ui.verts, (struct uivertex[]) {
 		{ .pos = { 0, 0 } },
-		{ .pos = { (1-meshpct)*width, 0 } },
+		{ .pos = { uiwidth, 0 } },
 		{ .pos = { 0, height } },
-		{ .pos = { (1-meshpct)*width, height } },
+		{ .pos = { uiwidth, height } },
 
 		{ .pos = { 50, 120 } },
 		{ .pos = { 50+32, 120 } },
@@ -965,9 +992,6 @@ setup_display(void)
 
 	/* TODO: allow resizing and window decorations */
 	glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-	glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-	glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
-	glfwWindowHint(GLFW_MAXIMIZED, GLFW_TRUE);
 	display.window = glfwCreateWindow(
 		width, height, progname, glfwGetPrimaryMonitor(), NULL);
 	if (display.window == NULL) {
@@ -987,10 +1011,14 @@ setup_display(void)
 		errx(1, "couldn't create surface for window: %s",
 			vkstrerror(res));
 	}
+	display.width = width;
+	display.height = height;
+	glfwSetWindowSize(display.window, display.width, display.height);
 	glfwSetKeyCallback(display.window, &keycb);
 	glfwSetMouseButtonCallback(display.window, &mousecb);
 	glfwSetScrollCallback(display.window, &scrollcb);
 	glfwSetCursorPosCallback(display.window, &cursorcb);
+	glfwSetWindowSizeCallback(display.window, &resizecb);
 
 	uint32_t devcnt;
 	res = vkEnumeratePhysicalDevices(instance, &devcnt, NULL);
@@ -1201,131 +1229,6 @@ setup_display(void)
 	display.mode = modes[0];
 	free(fmts);
 	free(modes);
-
-	res = vkCreateSwapchainKHR(device, &(VkSwapchainCreateInfoKHR){
-		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
-		.pNext = NULL,
-		.flags = 0,
-		.surface = display.surface,
-		.minImageCount = display.caps.minImageCount,
-		.imageFormat = display.fmt.format,
-		.imageColorSpace = display.fmt.colorSpace,
-		/* TODO: check caps */
-		.imageExtent = {
-			.width = width,
-			.height = height,
-		},
-		.imageArrayLayers = 1,
-		/* TODO: check caps */
-		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-			VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
-		.queueFamilyIndexCount = 1,
-		.pQueueFamilyIndices = (const uint32_t[]){ qfamidx },
-		.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
-		/* TODO: check caps */
-		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-		.presentMode = display.mode,
-		.clipped = VK_TRUE,
-		.oldSwapchain = VK_NULL_HANDLE,
-	}, NULL /* allocator */, &display.swapchain);
-	if (res != VK_SUCCESS) {
-		cleanup_display(DEVICE);
-		cleanup_before(DISPLAY);
-		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
-	}
-
-	uint32_t imcnt;
-	res = vkGetSwapchainImagesKHR(device, display.swapchain, &imcnt, NULL);
-	if (res != VK_SUCCESS) {
-		cleanup_display(SWAP_CHAIN);
-		cleanup_before(DISPLAY);
-		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
-	}
-	size_t imcap = imcnt;
-	VkImage *ims = nmalloc(sizeof(VkImage), imcap);
-	if (ims == NULL) {
-		cleanup_display(SWAP_CHAIN);
-		cleanup_before(DISPLAY);
-		err(1, "couldn't allocate memory for images");
-	}
-	while ((res = vkGetSwapchainImagesKHR(
-			device, display.swapchain, &imcnt, ims))
-			== VK_INCOMPLETE) {
-		if (SIZE_MAX / 2 / sizeof(VkImage) > imcap) {
-			cleanup_display(SWAP_CHAIN);
-			cleanup_before(DISPLAY);
-			errx(1, "can't store %zu physical devices", imcap);
-		}
-		imcap *= 2;
-		VkImage *tmp = realloc(modes, sizeof(VkImage) * imcap);
-		if (tmp == NULL) {
-			cleanup_display(SWAP_CHAIN);
-			cleanup_before(DISPLAY);
-			err(1, "coudln't allocate to store surface formats");
-		}
-		ims = tmp;
-		imcnt = imcap;
-	}
-	display.images = ims;
-	display.nims = imcnt;
-	display.semaphores = nmalloc(sizeof(VkSemaphore), imcnt);
-	if (display.semaphores == NULL) {
-		cleanup_display(SWAP_CHAIN);
-		cleanup_before(DISPLAY);
-		err(1, "couldn't allocate for semaphores");
-	}
-	display.nsems = 0;
-	for (size_t i = 0; i < display.nims; i++) {
-		res = vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-			.pNext = NULL,
-			.flags = 0,
-		}, NULL /* allocator */, display.semaphores+i);
-		if (res != VK_SUCCESS) {
-			cleanup_display(SEMAPHORES);
-			cleanup_before(DISPLAY);
-			errx(1, "couldn't create semaphore: %s", vkstrerror(res));
-		}
-		display.nsems++;
-	}
-
-	display.views = nmalloc(sizeof(VkImageView), display.nims);
-	if (display.views == NULL) {
-		cleanup_display(SEMAPHORES);
-		cleanup_before(DISPLAY);
-		err(1, "couldn't allocate for image views");
-	}
-	display.nviews = 0;
-	for (size_t i = 0; i < imcnt; i++) {
-		res = vkCreateImageView(device, &(VkImageViewCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-			.pNext = NULL,
-			.flags = 0,
-			.image = display.images[i],
-			.viewType = VK_IMAGE_VIEW_TYPE_2D,
-			.format = display.fmt.format,
-			.components = {
-				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
-				.a = VK_COMPONENT_SWIZZLE_IDENTITY,
-			},
-			.subresourceRange = {
-				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-				.baseMipLevel = 0,
-				.levelCount = 1,
-				.baseArrayLayer = 0,
-				.layerCount = 1,
-			}
-		}, NULL /* allocator */, display.views+i);
-		if (res != VK_SUCCESS) {
-			cleanup_display(IMAGE_VIEWS);
-			cleanup_before(DISPLAY);
-			errx(1, "couldn't create image view: %s", vkstrerror(res));
-		}
-		display.nviews++;
-	}
 }
 
 static void
@@ -1475,25 +1378,9 @@ setup_model(void)
 			.pNext = 0,
 			.flags = 0,
 			.viewportCount = 1,
-			.pViewports = &(VkViewport){
-				.x = (1-meshpct)*width,
-				.y = 0,
-				.width = meshpct * width,
-				.height = height,
-				.minDepth = 0.0,
-				.maxDepth = 1.0,
-			},
+			.pViewports = NULL,
 			.scissorCount = 1,
-			.pScissors = &(VkRect2D){
-				.offset = (VkOffset2D){
-					.x = (1-meshpct)*width,
-					.y = 0
-				},
-				.extent = (VkExtent2D){
-					.width = meshpct * width,
-					.height = height
-				},
-			},
+			.pScissors = NULL,
 		},
 		.pRasterizationState = &(VkPipelineRasterizationStateCreateInfo){
 			.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -1557,7 +1444,16 @@ setup_model(void)
 			},
 			.blendConstants = { 0, 0, 0, 0 },
 		},
-		.pDynamicState = NULL,
+		.pDynamicState = &(VkPipelineDynamicStateCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.dynamicStateCount = 2,
+			.pDynamicStates = (VkDynamicState[]){
+				VK_DYNAMIC_STATE_VIEWPORT,
+				VK_DYNAMIC_STATE_SCISSOR,
+			},
+		},
 		.layout = model.layout,
 		.renderPass = renderer.pass,
 		.subpass = 0,
@@ -1847,7 +1743,7 @@ setup_ui(void)
 			.pViewports = &(VkViewport){
 				.x = 0,
 				.y = 0,
-				.width = (1-meshpct) * width,
+				.width = uiwidth,
 				.height = height,
 				.minDepth = 0.0,
 				.maxDepth = 1.0,
@@ -1859,7 +1755,7 @@ setup_ui(void)
 					.y = 0
 				},
 				.extent = (VkExtent2D){
-					.width = (1-meshpct) * width,
+					.width = uiwidth,
 					.height = height
 				},
 			},
@@ -2210,7 +2106,6 @@ setup_renderer(void)
 		errx(1, "coudln't create descriptor pool: %s", vkstrerror(res));
 	}
 
-
 	res = vkCreateImage(device, &(VkImageCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
 		.pNext = NULL,
@@ -2380,37 +2275,6 @@ setup_renderer(void)
 		errx(1, "coudln't create render pass: %s", vkstrerror(res));
 	}
 
-	display.framebuffers = nmalloc(sizeof(VkFramebuffer), display.nims);
-	if (display.framebuffers == NULL) {
-		cleanup_renderer(RENDER_PASS);
-		cleanup_before(RENDERER);
-		err(1, "couldn't not allocate for framebuffers");
-	}
-	display.nfbs = 0;
-	for (size_t i = 0; i < display.nims; i++) {
-		res = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
-			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
-			.pNext = NULL,
-			.flags = 0,
-			.renderPass = renderer.pass,
-			.attachmentCount = 2,
-			.pAttachments = (VkImageView[]) {
-				display.views[i],
-				renderer.depth,
-			},
-			.width = width,
-			.height = height,
-			.layers = 1,
-		}, NULL /* allocator */, display.framebuffers+i);
-		if (res != VK_SUCCESS) {
-			cleanup_renderer(FRAMEBUFFERS);
-			cleanup_before(RENDERER);
-			errx(1, "coudln't allocate frame buffer: %s",
-				vkstrerror(res));
-		}
-		display.nfbs++;
-	}
-
 	res = vkCreateCommandPool(device, &(VkCommandPoolCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
 		.pNext = NULL,
@@ -2418,7 +2282,7 @@ setup_renderer(void)
 		.queueFamilyIndex = qfamidx,
 	}, NULL /* allocator */, &renderer.cpool);
 	if (res != VK_SUCCESS) {
-		cleanup_renderer(FRAMEBUFFERS);
+		cleanup_renderer(RENDER_PASS);
 		cleanup_before(RENDERER);
 		errx(1, "couldn't allocate command pool: %s", vkstrerror(res));
 	}
@@ -2459,6 +2323,168 @@ setup_renderer(void)
 }
 
 static void
+setup_screen(void)
+{
+	VkResult res;
+
+	res = vkCreateSwapchainKHR(device, &(VkSwapchainCreateInfoKHR){
+		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
+		.pNext = NULL,
+		.flags = 0,
+		.surface = display.surface,
+		.minImageCount = display.caps.minImageCount,
+		.imageFormat = display.fmt.format,
+		.imageColorSpace = display.fmt.colorSpace,
+		/* TODO: check caps */
+		.imageExtent = {
+			.width = display.width,
+			.height = display.height,
+		},
+		.imageArrayLayers = 1,
+		/* TODO: check caps */
+		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+			VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+		.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE,
+		.queueFamilyIndexCount = 1,
+		.pQueueFamilyIndices = (const uint32_t[]){ qfamidx },
+		.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+		/* TODO: check caps */
+		.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+		.presentMode = display.mode,
+		.clipped = VK_TRUE,
+		.oldSwapchain = VK_NULL_HANDLE,
+	}, NULL /* allocator */, &display.swapchain);
+	if (res != VK_SUCCESS) {
+		cleanup_before(SCREEN);
+		errx(1, "couldn't create swapchain: %s", vkstrerror(res));
+	}
+
+	uint32_t imcnt;
+	res = vkGetSwapchainImagesKHR(device, display.swapchain, &imcnt, NULL);
+	if (res != VK_SUCCESS) {
+		cleanup_screen(SWAP_CHAIN);
+		cleanup_before(SCREEN);
+		errx(1, "couldn't get swapchain images: %s", vkstrerror(res));
+	}
+	size_t imcap = imcnt;
+	VkImage *ims = nmalloc(sizeof(VkImage), imcap);
+	if (ims == NULL) {
+		cleanup_screen(SWAP_CHAIN);
+		cleanup_before(SCREEN);
+		err(1, "couldn't allocate memory for images");
+	}
+	while ((res = vkGetSwapchainImagesKHR(
+			device, display.swapchain, &imcnt, ims))
+			== VK_INCOMPLETE) {
+		if (SIZE_MAX / 2 / sizeof(VkImage) > imcap) {
+			cleanup_screen(SWAP_CHAIN);
+			cleanup_before(SCREEN);
+			errx(1, "can't store %zu physical devices", imcap);
+		}
+		imcap *= 2;
+		VkImage *tmp = realloc(ims, sizeof(VkImage) * imcap);
+		if (tmp == NULL) {
+			cleanup_screen(SWAP_CHAIN);
+			cleanup_before(SCREEN);
+			err(1, "coudln't allocate to store surface formats");
+		}
+		ims = tmp;
+		imcnt = imcap;
+	}
+	display.images = ims;
+	display.nims = imcnt;
+	display.semaphores = nmalloc(sizeof(VkSemaphore), imcnt);
+	if (display.semaphores == NULL) {
+		cleanup_screen(SWAP_CHAIN);
+		cleanup_before(SCREEN);
+		err(1, "couldn't allocate for semaphores");
+	}
+	display.nsems = 0;
+	for (size_t i = 0; i < display.nims; i++) {
+		res = vkCreateSemaphore(device, &(VkSemaphoreCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+		}, NULL /* allocator */, display.semaphores+i);
+		if (res != VK_SUCCESS) {
+			cleanup_screen(SEMAPHORES);
+			cleanup_before(DISPLAY);
+			errx(1, "couldn't create semaphore: %s", vkstrerror(res));
+		}
+		display.nsems++;
+	}
+
+	display.views = nmalloc(sizeof(VkImageView), display.nims);
+	if (display.views == NULL) {
+		cleanup_screen(SEMAPHORES);
+		cleanup_before(SCREEN);
+		err(1, "couldn't allocate for image views");
+	}
+	display.nviews = 0;
+	for (size_t i = 0; i < imcnt; i++) {
+		res = vkCreateImageView(device, &(VkImageViewCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.image = display.images[i],
+			.viewType = VK_IMAGE_VIEW_TYPE_2D,
+			.format = display.fmt.format,
+			.components = {
+				.r = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.g = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.b = VK_COMPONENT_SWIZZLE_IDENTITY,
+				.a = VK_COMPONENT_SWIZZLE_IDENTITY,
+			},
+			.subresourceRange = {
+				.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+				.baseMipLevel = 0,
+				.levelCount = 1,
+				.baseArrayLayer = 0,
+				.layerCount = 1,
+			}
+		}, NULL /* allocator */, display.views+i);
+		if (res != VK_SUCCESS) {
+			cleanup_screen(IMAGE_VIEWS);
+			cleanup_before(SCREEN);
+			errx(1, "couldn't create image view: %s", vkstrerror(res));
+		}
+		display.nviews++;
+	}
+
+	display.framebuffers = nmalloc(sizeof(VkFramebuffer), display.nims);
+	if (display.framebuffers == NULL) {
+		cleanup_screen(IMAGE_VIEWS);
+		cleanup_before(RENDERER);
+		err(1, "couldn't not allocate for framebuffers");
+	}
+	display.nfbs = 0;
+	for (size_t i = 0; i < display.nims; i++) {
+		res = vkCreateFramebuffer(device, &(VkFramebufferCreateInfo){
+			.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+			.pNext = NULL,
+			.flags = 0,
+			.renderPass = renderer.pass,
+			.attachmentCount = 2,
+			.pAttachments = (VkImageView[]) {
+				display.views[i],
+				renderer.depth,
+			},
+			.width = display.width,
+			.height = display.height,
+			.layers = 1,
+		}, NULL /* allocator */, display.framebuffers+i);
+		if (res != VK_SUCCESS) {
+			cleanup_renderer(FRAMEBUFFERS);
+			cleanup_before(RENDERER);
+			errx(1, "coudln't allocate frame buffer: %s",
+				vkstrerror(res));
+		}
+		display.nfbs++;
+	}
+
+}
+
+static void
 prerender_model(void)
 {
 	for (size_t i = 0; i < model.nobjs; i++) {
@@ -2475,7 +2501,8 @@ prerender_model(void)
 		mat4x4_translate(A, off[0], off[1], off[2]);
 		mat4x4_mul(M, A, M);
 		mat4x4_look_at(V, model.camera, model.target, model.up);
-		mat4x4_perspective(P, 120, width/height, -1, 1);
+		mat4x4_perspective(P, 120, (float)display.width/display.height,
+			-1, 1);
 		mat4x4_mul(A, V, M);
 		mat4x4_mul(model.transforms[i], P, A);
 		mat4x4_dup(model.models[i], M);
@@ -2512,6 +2539,24 @@ render_model(void)
 		&model.dset, 2, (uint32_t[]){ 0, 0 });
 	vkCmdBindPipeline(renderer.cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		model.pipeline);
+	vkCmdSetViewport(renderer.cmdbuf, 0, 1, (VkViewport[]){{
+		.x = uiwidth,
+		.y = 0,
+		.width = display.width - uiwidth,
+		.height = display.height,
+		.minDepth = 0.0,
+		.maxDepth = 1.0,
+	}});
+	vkCmdSetScissor(renderer.cmdbuf, 0, 1, (VkRect2D[]){{
+		.offset = (VkOffset2D){
+			.x = uiwidth,
+			.y = 0,
+		},
+		.extent = (VkExtent2D){
+			.width = display.width - uiwidth,
+			.height = display.height,
+		},
+	}});
 	vkCmdBindVertexBuffers(renderer.cmdbuf, 0, 1,
 		(VkBuffer[]){ model.vertbuf },
 		(VkDeviceSize[]){ 0 });
@@ -2627,7 +2672,7 @@ render_ui(void)
 		VK_INDEX_TYPE_UINT32);
 	vkCmdPushConstants(renderer.cmdbuf, ui.layout,
 		VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(vec2),
-		&(vec2){ (1-meshpct)*width, height });
+		&(vec2){ uiwidth, height });
 	for (size_t i = 0; i < ui.nicons; i++) {
 		vkCmdBindDescriptorSets(renderer.cmdbuf,
 			VK_PIPELINE_BIND_POINT_GRAPHICS, ui.layout, 0, 1,
@@ -2688,7 +2733,10 @@ render(void)
 		.framebuffer = display.framebuffers[idx],
 		.renderArea = {
 			.offset = { .x = 0, .y = 0 },
-			.extent = { .width = width, .height = height },
+			.extent = {
+				.width = display.width,
+				.height = display.height,
+			},
 		},
 		.clearValueCount = 2,
 		.pClearValues = (VkClearValue[]) { {
@@ -2751,9 +2799,20 @@ main(void)
 	setup_renderer();
 	setup_model();
 	setup_ui();
+	setup_screen();
 	struct timespec prev = {0};
 	while (!glfwWindowShouldClose(display.window)) {
-		render();
+		if (display.resize) {
+			VkQueue queue;
+			vkGetDeviceQueue(device, qfamidx, 0, &queue);
+			vkQueueWaitIdle(queue);
+			vkDeviceWaitIdle(device);
+			cleanup_screen(SCREEN_ALL);
+			setup_screen();
+			display.resize = false;
+		}
+		if (display.width != 0 && display.height != 0)
+			render();
 		glfwWaitEvents();
 
 		struct timespec curr;
