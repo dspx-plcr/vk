@@ -233,8 +233,9 @@ usabledev(
 	vkGetPhysicalDeviceQueueFamilyProperties2(dev, &qcnt, NULL);
 	if (SIZE_MAX / sizeof(VkQueueFamilyProperties2) < (size_t)qcnt ||
 			(size_t)qcnt != qcnt) {
-		warnx("can't allocate space for %zu queue family properties"
-			" (%zu * sizeof(VkQueueFamilyProperties2) > SIZE_MAX)",
+		warnx("can't allocate space for %" PRIu32 " queue family "
+			" properties (%" PRIu32 " *"
+			" sizeof(VkQueueFamilyProperties2) > SIZE_MAX)",
 			qcnt, qcnt);
 		return false;
 	}
@@ -919,9 +920,10 @@ setup_display(void)
 		errx(1, "couldn't get required vulkan extensions: %s", msg);
 	}
 	if (SIZE_MAX - numglfwexts < ARR_SZ(manualexts))
-		errx(1, "can't allocate more than SIZE_MAX (%zu) extensions:"
-			" GLFW requested %zu and we requested %zu", numglfwexts,
-			ARR_SZ(manualexts));
+		errx(1, "can't allocate more than SIZE_MAX (%" PRIu32 ")"
+			" extensions: GLFW requested %" PRIu32 " and we"
+			" requested %zu",
+			numglfwexts, numglfwexts, ARR_SZ(manualexts));
 	size_t nexts = numglfwexts + ARR_SZ(manualexts);
 	const char **exts = nmalloc(sizeof(char **), nexts);
 	if (exts == NULL)

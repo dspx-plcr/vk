@@ -1,5 +1,7 @@
 .SUFFIXES: .glsl .spv
 
+GLSL = glslang
+GFLAGS = --target-env vulkan1.1 -S $$(echo $^ | sed -e 's/\.[^.]*\.glsl//')
 CFLAGS = -std=gnu99 -pedantic -Wall -Wextra -g
 LDFLAGS = -lvulkan -lm -lglfw
 TARGET = vk
@@ -20,8 +22,7 @@ main.c: linmath.h
 	cc -c $(CFLAGS) $^
 
 .glsl.spv:
-	glslc -o $@ \
-		-fshader-stage=$$(echo $^ | sed -e 's/.\(model\|ui\).glsl//') $^
+	$(GLSL) -o $@ $(GFLAGS) $^
 
 clean:
 	rm -rf $(OBJS) $(TARGET) $(SHADERS)
